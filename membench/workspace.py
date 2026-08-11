@@ -11,7 +11,8 @@ INSTRUCTION_NAMES = (
     "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md",
     ".cursorrules", ".clinerules", ".windsurfrules", "CONVENTIONS.md", ".mcp.json",
 )
-# Fixed paths (files or directories) checked only at repo root.
+# Multi-segment file/dir patterns, matched at any depth via rglob (F2:
+# nested .claude/, .cursor/rules/ etc. below repo root are not root-only).
 INSTRUCTION_PATHS = (
     ".claude", ".cursor/rules", ".github/copilot-instructions.md", ".github/instructions",
 )
@@ -25,6 +26,14 @@ def _to_https(url: str) -> str:
     return url
 
 
+def _purge_unreachable(repo_dir: Path) -> None:
+    """Expire the reflog and gc. Any history rewrite (ref deletion, amend)
+    leaves the old objects as loose garbage until this runs — same shape
+    for the fallback clone path (C3) and for instruction-file stripping (I1)."""
+    subprocess.run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "gc", "--prune=now"], cwd=repo_dir, check=True, capture_output=True)
+
+
 def _prune_to_single_commit(repo_dir: Path) -> None:
     """Fallback path only. Ref deletion alone leaves abandoned commits (e.g.
     the default branch tip fetched by the initial non-pinned clone) sitting
@@ -35,8 +44,7 @@ def _prune_to_single_commit(repo_dir: Path) -> None:
     ).stdout.split()
     for ref in refs:
         subprocess.run(["git", "update-ref", "-d", ref], cwd=repo_dir, check=True, capture_output=True)
-    subprocess.run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=repo_dir, check=True, capture_output=True)
-    subprocess.run(["git", "gc", "--prune=now"], cwd=repo_dir, check=True, capture_output=True)
+    _purge_unreachable(repo_dir)
 
 
 def _clone_fallback(url: str, sha: str, dest: Path) -> None:
@@ -108,10 +116,16 @@ def _provision_submodules(repo_dir: Path) -> None:
 
 
 def _remove(p: Path) -> bool:
+    # F3: is_dir() follows symlinks, so a symlink to a directory would reach
+    # rmtree and crash ("Cannot call rmtree on a symbolic link") — check
+    # is_symlink() first and just unlink it, whatever it points at.
+    if p.is_symlink():
+        p.unlink()
+        return True
     if p.is_dir():
         shutil.rmtree(p)
         return True
-    if p.exists() or p.is_symlink():
+    if p.exists():
         p.unlink()
         return True
     return False
@@ -121,41 +135,65 @@ def _submodule_paths(repo_dir: Path) -> set[Path]:
     return {(repo_dir / p).resolve() for p, _ in _submodule_entries(repo_dir)}
 
 
-def _strip_instruction_files(repo_dir: Path) -> None:
-    """Removes agent instruction files/dirs and, if anything was tracked,
-    folds the removal into the (single, shallow) HEAD commit — a plain
-    unlink leaves the content in `git show HEAD:...` and a dirty tree (I1)."""
-    sub_dirs = _submodule_paths(repo_dir)  # handled by their own repos, skip here
-    changed = False
-    for name in INSTRUCTION_NAMES:
-        for hit in repo_dir.rglob(name):
+def _find_instruction_hits(repo_dir: Path) -> list[Path]:
+    """Every instruction file/dir under repo_dir, at any depth (F2), excluding
+    .git internals and anything inside a submodule (submodules are separate
+    repos, scanned/stripped by recursing into them, not by crossing into
+    their working tree from here — F1: stripping and checking must agree)."""
+    sub_dirs = _submodule_paths(repo_dir)
+    hits: list[Path] = []
+    for pattern in INSTRUCTION_NAMES + INSTRUCTION_PATHS:
+        for hit in repo_dir.rglob(pattern):
             if ".git" in hit.parts:
                 continue
-            if any(hit.resolve() == sd or sd in hit.resolve().parents for sd in sub_dirs):
+            resolved = hit.resolve()
+            if any(resolved == sd or sd in resolved.parents for sd in sub_dirs):
                 continue
-            if _remove(hit):
-                changed = True
-    for rel in INSTRUCTION_PATHS:
-        if _remove(repo_dir / rel):
-            changed = True
-    if not changed:
-        return
+            hits.append(hit)
+    return hits
+
+
+def _amend_and_purge(repo_dir: Path) -> None:
+    """I1: `commit --amend` alone leaves the pre-amend commit (and any blobs
+    unique to it, e.g. the instruction file's content) as loose garbage —
+    `git show <old_sha>:CLAUDE.md` still works until this runs."""
     subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "-c", "user.email=membench@local", "-c", "user.name=membench",
          "commit", "--amend", "--no-edit", "-q"],
         cwd=repo_dir, check=True, capture_output=True,
     )
+    _purge_unreachable(repo_dir)
 
 
-def provision(task: BenchTask, dest: Path) -> Path:
+def _seal_repo(repo_dir: Path) -> bool:
+    """Strips instruction files from repo_dir, then recurses into every
+    submodule doing the same. If a submodule's own HEAD moves (something was
+    stripped there), re-stage the gitlink in the parent so it never drifts
+    from what's actually checked out, and amend+purge the parent too.
+    Returns whether repo_dir's HEAD was rewritten."""
+    changed = False
+    for hit in _find_instruction_hits(repo_dir):
+        if _remove(hit):
+            changed = True
+    for rel_path, _ in _submodule_entries(repo_dir):
+        if _seal_repo(repo_dir / rel_path):
+            subprocess.run(["git", "add", rel_path], cwd=repo_dir, check=True, capture_output=True)
+            changed = True
+    if not changed:
+        return False
+    _amend_and_purge(repo_dir)
+    return True
+
+
+def provision(task: BenchTask, dest: Path, *, url: str = UPSTREAM) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         shutil.rmtree(dest)
-    _clone_at(UPSTREAM, task.base_sha, dest)
+    _clone_at(url, task.base_sha, dest)
     subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
     _provision_submodules(dest)
-    _strip_instruction_files(dest)
+    _seal_repo(dest)
 
     # D17: a workspace checked only by a separate gate ships unchecked
     # whenever that gate is skipped — provision() must self-verify and raise.
@@ -214,17 +252,8 @@ def _check_repo(repo_dir: Path, leaks: list[str], label: str) -> None:
     elif status.stdout.strip():
         leaks.append(f"{label}: working tree not clean: {status.stdout.strip()!r}")
 
-    sub_dirs = _submodule_paths(repo_dir)
-    for name in INSTRUCTION_NAMES:
-        for hit in repo_dir.rglob(name):
-            if ".git" in hit.parts:
-                continue
-            if any(hit.resolve() == sd or sd in hit.resolve().parents for sd in sub_dirs):
-                continue
-            leaks.append(f"{label}: agent instruction file present: {hit.relative_to(repo_dir)}")
-    for rel in INSTRUCTION_PATHS:
-        if (repo_dir / rel).exists():
-            leaks.append(f"{label}: agent instruction path present: {rel}")
+    for hit in _find_instruction_hits(repo_dir):
+        leaks.append(f"{label}: agent instruction file present: {hit.relative_to(repo_dir)}")
 
     for rel_path, _ in _submodule_entries(repo_dir):
         _check_repo(repo_dir / rel_path, leaks, f"{label}/{rel_path}")

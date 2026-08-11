@@ -1,12 +1,13 @@
 import subprocess
 from pathlib import Path
+from membench.corpus.extract import BenchTask
 from membench.workspace import (
     provision,
     verify_sealed,
     UPSTREAM,
     _clone_at,
     _provision_submodules,
-    _strip_instruction_files,
+    _seal_repo,
 )
 
 # golden-liquid tip at the fix commit — the post-fix oracle a leaking
@@ -131,7 +132,7 @@ def test_strips_instruction_file_from_history_and_leaves_clean_tree(tmp_path: Pa
 
     dest = tmp_path / "ws"
     _clone_at(str(src), sha, dest)
-    _strip_instruction_files(dest)
+    _seal_repo(dest)
 
     assert not (dest / "CLAUDE.md").exists()
     show = subprocess.run(["git", "show", "HEAD:CLAUDE.md"], cwd=dest, capture_output=True, text=True)
@@ -157,7 +158,7 @@ def test_strips_nested_and_directory_instruction_paths(tmp_path: Path):
 
     dest = tmp_path / "ws2"
     _clone_at(str(src), sha, dest)
-    _strip_instruction_files(dest)
+    _seal_repo(dest)
 
     assert not (dest / "sub" / "CLAUDE.md").exists()
     assert not (dest / ".claude").exists()
@@ -184,3 +185,104 @@ def test_verify_sealed_git_failure_is_a_leak(tmp_path: Path):
     (broken / ".git").write_text("not a real git dir")
     leaks = verify_sealed(broken)
     assert leaks, "a broken repo must never be reported as sealed ([] is a pass)"
+
+
+# --- I1 (fix round 2): amend alone leaves the pre-amend blob reachable by
+# SHA — must purge (reflog expire + gc) after rewriting history. Goes
+# through the real provision() -> verify_sealed() path end to end, not just
+# the stripping helper in isolation (that's exactly what let the bug through
+# fix round 1's tests).
+
+def test_provision_purges_amended_instruction_file_end_to_end(tmp_path: Path):
+    src = tmp_path / "src3"
+    _init_local_repo(src)
+    (src / "CLAUDE.md").write_text("SECRET: the fix is in loop.py, change line 42")
+    (src / "real.py").write_text("x = 1\n")
+    pre_amend_sha = _seed_commit(src)
+
+    task = BenchTask(
+        task_id="synthetic-i1", repo="local/synthetic", issue_number=1,
+        issue_title="", issue_body="", base_sha=pre_amend_sha, fix_sha="0" * 40, changed_files=[],
+    )
+    wd = provision(task, tmp_path / "ws3", url=str(src))
+
+    show = subprocess.run(
+        ["git", "show", f"{pre_amend_sha}:CLAUDE.md"], cwd=wd, capture_output=True, text=True
+    )
+    assert show.returncode != 0, "pre-amend commit's blob must be unreachable by SHA after purge"
+    assert verify_sealed(wd) == [], "provision()'s own seal check must pass, not just log/status"
+
+
+# --- F1: stripping and checking must agree about submodules ----------------
+
+def test_seals_instruction_file_inside_submodule(tmp_path: Path):
+    sub_src = tmp_path / "subsrc"
+    _init_local_repo(sub_src)
+    (sub_src / "CLAUDE.md").write_text("leaked from submodule")
+    (sub_src / "data.txt").write_text("d")
+    _seed_commit(sub_src)
+
+    parent_src = tmp_path / "parentsrc"
+    _init_local_repo(parent_src)
+    subprocess.run(
+        ["git", "-C", str(parent_src), "-c", "protocol.file.allow=always",
+         "submodule", "add", str(sub_src), "vendor/sub"],
+        check=True, capture_output=True,
+    )
+    parent_sha = _seed_commit(parent_src)
+
+    dest = tmp_path / "ws4"
+    _clone_at(str(parent_src), parent_sha, dest)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
+    _provision_submodules(dest)
+    _seal_repo(dest)
+
+    assert not (dest / "vendor" / "sub" / "CLAUDE.md").exists()
+    assert verify_sealed(dest) == [], "checking must not raise on a leak that stripping already fixed"
+
+    sub_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=dest / "vendor" / "sub", capture_output=True, text=True, check=True
+    ).stdout.strip()
+    pinned = subprocess.run(
+        ["git", "ls-tree", "HEAD", "--", "vendor/sub"], cwd=dest, capture_output=True, text=True, check=True
+    ).stdout.split()[2]
+    assert pinned == sub_head, "parent gitlink must follow the submodule's amended HEAD, not drift from it"
+
+
+# --- F2: directory-shaped instruction carriers below repo root -------------
+
+def test_strips_instruction_dir_nested_below_root(tmp_path: Path):
+    src = tmp_path / "src6"
+    _init_local_repo(src)
+    (src / "sub" / ".claude").mkdir(parents=True)
+    (src / "sub" / ".claude" / "settings.json").write_text("{}")
+    (src / "real.py").write_text("x = 1\n")
+    sha = _seed_commit(src)
+
+    dest = tmp_path / "ws6"
+    _clone_at(str(src), sha, dest)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
+    _seal_repo(dest)
+
+    assert not (dest / "sub" / ".claude").exists()
+    assert (dest / "real.py").exists()
+    assert verify_sealed(dest) == []
+
+
+# --- F3: symlink to a directory must not crash rmtree -----------------------
+
+def test_removes_symlink_to_directory_without_crashing(tmp_path: Path):
+    src = tmp_path / "src7"
+    _init_local_repo(src)
+    (src / "real_target").mkdir()
+    (src / "real_target" / "f.txt").write_text("x")
+    (src / ".claude").symlink_to("real_target", target_is_directory=True)
+    (src / "real.py").write_text("x = 1\n")
+    sha = _seed_commit(src)
+
+    dest = tmp_path / "ws7"
+    _clone_at(str(src), sha, dest)
+    _seal_repo(dest)  # must not raise OSError
+
+    assert not (dest / ".claude").exists()
+    assert (dest / "real.py").exists()
