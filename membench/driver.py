@@ -1,7 +1,10 @@
 import json
 import os
+import re
 import subprocess
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 from membench.models import ToolCall, Transcript
@@ -37,11 +40,24 @@ _PASSTHROUGH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 # would otherwise let the agent open an AF_PACKET socket and hand-craft
 # link-layer frames that bypass the iptables OUTPUT chain entirely
 # (verified empirically, see task-13-report.md).
+# I3: DAC_OVERRIDE is kept (never dropped in seal-egress.sh's final setpriv
+# call) so uid 1000 can read/write the bind-mounted workspace/HOME/CONFIG
+# dirs, which land root:root mode 700 through the VM's virtiofs layer.
+# The alternative (chmod the mount) mutates the HOST directory's real
+# permission bits permanently - verified, and never reverted.
 _CAP_ARGS = [
     "--cap-drop=ALL",
     "--cap-add=NET_ADMIN", "--cap-add=SETPCAP",
     "--cap-add=SETUID", "--cap-add=SETGID",
+    "--cap-add=DAC_OVERRIDE",
 ]
+
+# D26: WebSearch/WebFetch execute server-side on Anthropic's infrastructure
+# and return content over the very connection the seal allowlists -
+# iptables never sees a GitHub-bound packet for these. Unlike the failed
+# Bash denylist (interpreters have alternate paths), a server-side tool has
+# exactly one path, so denying it at the tool layer is airtight here.
+_DISALLOWED_TOOLS = "WebSearch,WebFetch"
 
 
 def _ensure_image() -> str:
@@ -52,6 +68,55 @@ def _ensure_image() -> str:
         check=True, capture_output=True, text=True,
     )
     return _IMAGE_TAG
+
+
+def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProcess:
+    """I1: `docker run --rm` on a client-side subprocess timeout only kills
+    the docker CLI, not the container - it keeps running detached,
+    bind-mounted workspace and all, billing. Always pass --name so a
+    timeout can clean up the actual container too.
+
+    `docker kill` alone is not enough: verified live that a timeout hitting
+    early (client killed before the container leaves "Created" for
+    "Running") leaves it un-killable - `kill` signals a running process and
+    is a no-op on one that never started. `docker rm -f` removes it in any
+    state (created, running, or already exited), so that's what runs here."""
+    name = f"membench-{uuid.uuid4().hex[:12]}"
+    cmd = ["docker", "run", "--rm", "--name", name, *args]
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        # Killing the client that early can race the daemon still finishing
+        # the container's own create/start - verified live: an immediate
+        # `docker rm -f` right after the kill can find nothing yet and
+        # silently no-op, leaving the container to appear a moment later.
+        # A few short retries cover that window; ponytail: fixed small
+        # retry count, not a real backoff loop - raise the retry cap if
+        # this is ever observed to still leak in practice.
+        for _ in range(5):
+            if subprocess.run(["docker", "rm", "-f", name], capture_output=True).returncode == 0:
+                break
+            time.sleep(0.5)
+        raise
+
+
+def tools_from_init(raw: str) -> list[str]:
+    """Pulls the `tools` list out of the stream-json init event. Emitted by
+    the CLI before any model turn, so this is checkable even when auth
+    fails - and deterministic in a way the model's own prose never is."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if evt.get("type") == "system" and evt.get("subtype") == "init":
+            return evt.get("tools", [])
+    return []
 
 
 def _container_env_args(home_dir: str = _CONTAINER_HOME, config_dir: str = _CONTAINER_CONFIG) -> list[str]:
@@ -129,9 +194,8 @@ def run_agent(
     image = _ensure_image()
     with tempfile.TemporaryDirectory(prefix="membench-cfg-") as config_dir, \
          tempfile.TemporaryDirectory(prefix="membench-home-") as home_dir:
-        proc = subprocess.run(
+        proc = _docker_run(
             [
-                "docker", "run", "--rm",
                 *_CAP_ARGS,
                 "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
                 "-v", f"{config_dir}:{_CONTAINER_CONFIG}",
@@ -146,13 +210,13 @@ def run_agent(
                 # D22: the container is the boundary, not the tool layer -
                 # full Bash, no denylist, no acceptEdits gate. Recommended
                 # by `claude --help` specifically "for sandboxes with no
-                # internet access", which this is.
+                # internet access", which this is. D26: WebSearch/WebFetch
+                # are the one exception - they run server-side, outside the
+                # container entirely, so they're still denied explicitly.
                 "--dangerously-skip-permissions",
+                "--disallowedTools", _DISALLOWED_TOOLS,
             ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            stdin=subprocess.DEVNULL,   # without this every run stalls 3s waiting on stdin
+            timeout_s=timeout_s,
         )
     text, calls, meta = _parse_stream(proc.stdout)
     return Transcript(
@@ -170,22 +234,42 @@ def run_agent(
 def egress_sealed(workdir: Path) -> dict:
     """Starts the sealed container and probes both hosts directly (no
     agent/credential involved) - `{"anthropic": reachable, "github":
-    reachable}`. A healthy seal is `{"anthropic": True, "github": False}`."""
+    reachable}`. A healthy seal is `{"anthropic": True, "github": False}`.
+
+    Fails loud (D13/D17 precedent: unknown state is never reported as a
+    pass) rather than inferring "reachable" from a missing marker - a
+    failed `docker run` (bad image, daemon hiccup: rc=125, empty stdout)
+    used to read as `{"anthropic": True, "github": True}` by the old
+    absence-based check, indistinguishable from a real double-reach."""
     image = _ensure_image()
-    proc = subprocess.run(
+    proc = _docker_run(
         [
-            "docker", "run", "--rm",
             *_CAP_ARGS,
             "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
             image,
             "sh", "-c",
+            # `; true` at the end: a blocked github curl exits nonzero, and
+            # that becomes the CONTAINER's exit code (which docker run then
+            # passes through as its own rc) - that's the expected healthy
+            # case, not a docker-level failure, so it must not trip the
+            # returncode check below. seal-egress.sh's own failure exits
+            # (e.g. I2's empty-allowlist guard) happen before this command
+            # even runs and still propagate correctly.
             "curl -s -m 5 -o /dev/null -w 'anthropic=%{http_code}\\n' https://api.anthropic.com/; "
-            "curl -s -m 5 -o /dev/null -w 'github=%{http_code}\\n' https://api.github.com/",
+            "curl -s -m 5 -o /dev/null -w 'github=%{http_code}\\n' https://api.github.com/; true",
         ],
-        capture_output=True, text=True, timeout=60,
+        timeout_s=60,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"egress_sealed: `docker run`/seal-egress.sh failed (rc={proc.returncode}): {proc.stderr.strip()}"
+        )
     out = proc.stdout
+    anthropic_m = re.search(r"anthropic=(\d{3})", out)
+    github_m = re.search(r"github=(\d{3})", out)
+    if not anthropic_m or not github_m:
+        raise RuntimeError(f"egress_sealed: probe markers missing from container output: {out!r}")
     return {
-        "anthropic": "anthropic=000" not in out,
-        "github": "github=000" not in out,
+        "anthropic": anthropic_m.group(1) != "000",
+        "github": github_m.group(1) != "000",
     }

@@ -30,7 +30,9 @@ def test_run_agent_captures_result_metadata(tmp_path: Path):
     )
     assert t.num_turns > 0
     assert t.cost_usd > 0
-    assert t.permission_denials == []
+    # D27: --dangerously-skip-permissions (Task 13) makes permission_denials
+    # unfalsifiable - it is always [] regardless of what the container
+    # actually blocked. No assertion on it here or anywhere else.
 
 
 # The tool-layer deny-list this test used to exercise (--disallowedTools
