@@ -1242,9 +1242,9 @@ def gate_report(task: BenchTask) -> tuple[bool, list[GateResult]]:
 # membench/cli.py
 import argparse
 import json
-import statistics
 from pathlib import Path
 
+from membench.corpus.extract import BenchTask
 from membench.gate.report import gate_report
 
 
@@ -1255,7 +1255,7 @@ def main() -> int:
     ap.add_argument("--model", default="claude-sonnet-5")
     args = ap.parse_args()
 
-    tasks = [json.loads(p.read_text()) for p in sorted(args.tasks.glob("*.json"))]
+    tasks = [BenchTask(**json.loads(p.read_text())) for p in sorted(args.tasks.glob("*.json"))]
     print(f"loaded {len(tasks)} tasks; scaffold: model={args.model} repeats={args.repeats}")
     # Gate every task before any arm runs.
     for t in tasks:
