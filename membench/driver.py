@@ -2,7 +2,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -41,15 +40,22 @@ _PASSTHROUGH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 # link-layer frames that bypass the iptables OUTPUT chain entirely
 # (verified empirically, see task-13-report.md).
 # I3: DAC_OVERRIDE is kept (never dropped in seal-egress.sh's final setpriv
-# call) so uid 1000 can read/write the bind-mounted workspace/HOME/CONFIG
-# dirs, which land root:root mode 700 through the VM's virtiofs layer.
-# The alternative (chmod the mount) mutates the HOST directory's real
-# permission bits permanently - verified, and never reverted.
+# call) so uid 1000 can read/write the bind-mounted /workspace dir, which
+# lands root:root mode 700 through the VM's virtiofs layer. The alternative
+# (chmod the mount) mutates the HOST directory's real permission bits
+# permanently - verified, and never reverted. Reconsidered per review round
+# 2: HOME/CONFIG no longer need this (they're container-local paths now,
+# chown'd by seal-egress.sh itself - see below), only /workspace does, since
+# that's the one mount the harness actually reads results back from.
+# CHOWN: root needs it too (--cap-drop=ALL strips it from root same as
+# everything else) to `chown` the container-local HOME/CONFIG dirs to uid
+# 1000 before the privilege drop; dropped again in the same setpriv call,
+# same as the rest - the agent never holds it.
 _CAP_ARGS = [
     "--cap-drop=ALL",
     "--cap-add=NET_ADMIN", "--cap-add=SETPCAP",
     "--cap-add=SETUID", "--cap-add=SETGID",
-    "--cap-add=DAC_OVERRIDE",
+    "--cap-add=DAC_OVERRIDE", "--cap-add=CHOWN",
 ]
 
 # D26: WebSearch/WebFetch execute server-side on Anthropic's infrastructure
@@ -80,7 +86,14 @@ def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProce
     early (client killed before the container leaves "Created" for
     "Running") leaves it un-killable - `kill` signals a running process and
     is a no-op on one that never started. `docker rm -f` removes it in any
-    state (created, running, or already exited), so that's what runs here."""
+    state (created, running, or already exited) - EXCEPT its own return code
+    cannot be trusted to tell you which happened (N3): `docker rm -f` on a
+    name that does not exist yet still exits 0, with "No such container"
+    only on stderr - checking rc alone made the original retry loop break on
+    iteration 0 unconditionally (verified: it "succeeded" whether or not
+    anything was actually removed, which is exactly why 4/5 early-timeout
+    runs still leaked under that version). Poll actual existence via
+    `docker inspect` instead of trusting `rm`'s exit status."""
     name = f"membench-{uuid.uuid4().hex[:12]}"
     cmd = ["docker", "run", "--rm", "--name", name, *args]
     try:
@@ -88,17 +101,20 @@ def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProce
             cmd, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        # Killing the client that early can race the daemon still finishing
-        # the container's own create/start - verified live: an immediate
-        # `docker rm -f` right after the kill can find nothing yet and
-        # silently no-op, leaving the container to appear a moment later.
-        # A few short retries cover that window; ponytail: fixed small
-        # retry count, not a real backoff loop - raise the retry cap if
-        # this is ever observed to still leak in practice.
-        for _ in range(5):
-            if subprocess.run(["docker", "rm", "-f", name], capture_output=True).returncode == 0:
-                break
+        # The daemon can still be finishing the container's own create/start
+        # after the client is killed - a container that doesn't exist YET at
+        # the first check can still appear a moment later. Loop rm+re-check
+        # across a window rather than trusting a single pass either way.
+        # ponytail: fixed retry count/interval, not a real backoff - raise
+        # the cap if this is ever observed to still leak in practice.
+        for _ in range(10):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             time.sleep(0.5)
+            still_exists = subprocess.run(
+                ["docker", "inspect", name], capture_output=True
+            ).returncode == 0
+            if not still_exists:
+                break
         raise
 
 
@@ -119,12 +135,16 @@ def tools_from_init(raw: str) -> list[str]:
     return []
 
 
-def _container_env_args(home_dir: str = _CONTAINER_HOME, config_dir: str = _CONTAINER_CONFIG) -> list[str]:
+def _container_env_args() -> list[str]:
     """`-e KEY=VALUE` args for `docker run`. Never forwards the host's
-    os.environ - only this explicit allowlist reaches the container."""
+    os.environ - only this explicit allowlist reaches the container. HOME
+    and CLAUDE_CONFIG_DIR point at container-local paths (never bind-mounted -
+    review round 2: no reason to route them through the host filesystem at
+    all when nothing needs to read them back afterward); seal-egress.sh
+    creates and chowns them itself before dropping to uid 1000."""
     env = {
-        "HOME": home_dir,  # fresh per-run dir: no host dotfiles/creds
-        "CLAUDE_CONFIG_DIR": config_dir,  # fresh per-run dir: no host CLAUDE.md/hooks/plugins/skills/auto-memory
+        "HOME": _CONTAINER_HOME,  # fresh per-run, container-local: no host dotfiles/creds
+        "CLAUDE_CONFIG_DIR": _CONTAINER_CONFIG,  # fresh per-run, container-local: no host CLAUDE.md/hooks/plugins/skills/auto-memory
         "TZ": "UTC",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -192,32 +212,28 @@ def run_agent(
     `claude` subprocess - stdout is still stream-json, so _parse_stream
     needs no changes."""
     image = _ensure_image()
-    with tempfile.TemporaryDirectory(prefix="membench-cfg-") as config_dir, \
-         tempfile.TemporaryDirectory(prefix="membench-home-") as home_dir:
-        proc = _docker_run(
-            [
-                *_CAP_ARGS,
-                "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
-                "-v", f"{config_dir}:{_CONTAINER_CONFIG}",
-                "-v", f"{home_dir}:{_CONTAINER_HOME}",
-                *_container_env_args(),
-                image,
-                "claude", "-p", prompt,
-                "--output-format", "stream-json",
-                "--verbose",
-                "--max-turns", str(max_turns),
-                "--model", model,
-                # D22: the container is the boundary, not the tool layer -
-                # full Bash, no denylist, no acceptEdits gate. Recommended
-                # by `claude --help` specifically "for sandboxes with no
-                # internet access", which this is. D26: WebSearch/WebFetch
-                # are the one exception - they run server-side, outside the
-                # container entirely, so they're still denied explicitly.
-                "--dangerously-skip-permissions",
-                "--disallowedTools", _DISALLOWED_TOOLS,
-            ],
-            timeout_s=timeout_s,
-        )
+    proc = _docker_run(
+        [
+            *_CAP_ARGS,
+            "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
+            *_container_env_args(),
+            image,
+            "claude", "-p", prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--max-turns", str(max_turns),
+            "--model", model,
+            # D22: the container is the boundary, not the tool layer -
+            # full Bash, no denylist, no acceptEdits gate. Recommended
+            # by `claude --help` specifically "for sandboxes with no
+            # internet access", which this is. D26: WebSearch/WebFetch
+            # are the one exception - they run server-side, outside the
+            # container entirely, so they're still denied explicitly.
+            "--dangerously-skip-permissions",
+            "--disallowedTools", _DISALLOWED_TOOLS,
+        ],
+        timeout_s=timeout_s,
+    )
     text, calls, meta = _parse_stream(proc.stdout)
     return Transcript(
         text=text,
@@ -246,6 +262,7 @@ def egress_sealed(workdir: Path) -> dict:
         [
             *_CAP_ARGS,
             "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
+            *_container_env_args(),  # seal-egress.sh unconditionally mkdir/chowns $HOME/$CLAUDE_CONFIG_DIR
             image,
             "sh", "-c",
             # `; true` at the end: a blocked github curl exits nonzero, and

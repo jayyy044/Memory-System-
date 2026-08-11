@@ -8,7 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv git iptables util-linux \
         ca-certificates dnsutils curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir --break-system-packages pytest pytest-json-report \
+    # N2: generic test-tooling baked in alongside pytest itself - hypothesis
+    # and mock are common across Python test suites (not liquid-specific);
+    # this is the "bake into the image" half of D32's two acceptable shapes,
+    # applied to test-only tooling that isn't discoverable from a repo's
+    # standard [project.dependencies] metadata (liquid declares them under
+    # a hatch-specific [tool.hatch.envs.default] block, not PEP 621).
+    && pip3 install --no-cache-dir --break-system-packages pytest pytest-json-report hypothesis mock \
     && npm install -g @anthropic-ai/claude-code@2.1.227 \
     && npm cache clean --force
 # claude refuses --dangerously-skip-permissions as root/sudo ("cannot be
@@ -20,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # no need to add a second one.
 
 COPY seal-egress.sh /usr/local/bin/seal-egress.sh
+COPY collect_deps.py /usr/local/bin/collect_deps.py
 RUN chmod +x /usr/local/bin/seal-egress.sh
 
 WORKDIR /workspace

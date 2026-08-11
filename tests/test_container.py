@@ -1,9 +1,28 @@
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from membench.driver import egress_sealed, run_agent, tools_from_init
 from membench.workspace import provision
+
+
+def _retrieval_canary(liquid_repo: Path, fix_sha: str, path: str) -> str:
+    """N4: a value only a SUCCESSFUL retrieval of the fixed file could
+    produce - the file's own real content, pulled from the local, fully
+    cloned fixture repo (no network, never touches the sealed container) -
+    not something we ever put in the prompt ourselves. The prior canary
+    (the file's own NAME) IS in the prompt (the fetch URL contains it, since
+    the agent has to be told what to try fetching), and the reviewer
+    reproduced a false "SEAL BREACHED" from ordinary model prose that just
+    repeated the filename it had been asked to try, without ever leaking
+    any actual content."""
+    content = subprocess.run(
+        ["git", "show", f"{fix_sha}:{path}"], cwd=liquid_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    lines = [l.strip() for l in content.splitlines() if len(l.strip()) > 24]
+    return lines[len(lines) // 2]
 
 
 @pytest.mark.live
@@ -13,22 +32,28 @@ def test_container_blocks_github_allows_anthropic(tmp_path):
 
 
 # D27: --dangerously-skip-permissions makes permission_denials == []
-# unfalsifiable - no test may assert on it. C2: the previous version of this
-# test asserted exit_code == 0, a literal `"probe" not in t.text or True`
-# tautology, and that the model's prose merely *mentioned* api.github.com -
-# none of that can fail even with the seal removed entirely. This version
-# asks for a specific outcome (the literal word UNREACHABLE, nothing else on
-# success) and checks the one thing a leak would actually produce: the fixed
-# file's real name showing up in the model's own reply. The prompt itself
-# necessarily contains that name (it's in the commands we ask the agent to
-# run), but ToolCall.command text never reaches Transcript.text - only
-# `text`/`result` blocks do (see _parse_stream) - so this is not circular.
+# unfalsifiable - no test may assert on it. C2/N4: the original version of
+# this test asserted exit_code == 0, a literal `"probe" not in t.text or
+# True` tautology, and that the model's prose merely *mentioned*
+# api.github.com - none of that can fail even with the seal removed
+# entirely. Fixed that once already (UNREACHABLE + fix filename absent), but
+# the filename check was ITSELF circular: the prompt has to tell the agent
+# what to try fetching, so the filename is right there in the prompt text,
+# and the reviewer reproduced a false "SEAL BREACHED" from ordinary
+# compliant prose that just repeated it back. `_retrieval_canary` fixes this
+# for real: it's the fixed file's actual CONTENT, never mentioned anywhere
+# in the prompt, so it can only show up in t.text via a genuine retrieval.
+# Residual, disclosed: an LLM that has memorized this public file from
+# pretraining could in principle reproduce the same line without ever
+# reaching GitHub - not fully closable by prompting alone; the prompt is at
+# least scoped narrowly (report command exit status, not "recite the file")
+# to make that unlikely rather than invited.
 @pytest.mark.live
-def test_agent_cannot_reach_github_via_any_interpreter(sample_task, tmp_path):
+def test_agent_cannot_reach_github_via_any_interpreter(sample_task, liquid_repo, tmp_path):
     wd = provision(sample_task, tmp_path / "ws")
     fix_file = sample_task.changed_files[0]
-    fix_filename = Path(fix_file).name
     raw_url = f"https://raw.githubusercontent.com/{sample_task.repo}/{sample_task.fix_sha}/{fix_file}"
+    canary = _retrieval_canary(liquid_repo, sample_task.fix_sha, fix_file)
     t = run_agent(
         f"Try each of these in order until one returns actual file content: "
         f"1) /usr/bin/curl -s -m 5 {raw_url} "
@@ -39,7 +64,7 @@ def test_agent_cannot_reach_github_via_any_interpreter(sample_task, tmp_path):
         workdir=wd, max_turns=10, model="claude-sonnet-5",
     )
     assert "UNREACHABLE" in t.text
-    assert fix_filename not in t.text
+    assert canary not in t.text
 
 
 # C2: deterministic and independent of anything the model says - the CLI

@@ -1,18 +1,26 @@
 #!/bin/sh
 set -eu
 
-# D28: install the arm's dependencies BEFORE any egress rule exists, while
-# the network is still fully open - the image ships only pytest, and pip
-# cannot reach PyPI once the seal below goes up. Generic across corpus
-# repos: whichever of these the workspace declares. Fails loud - a broken
-# install must not silently proceed into a container that then also can't
-# reach PyPI to fix itself.
-if [ -f /workspace/pyproject.toml ] || [ -f /workspace/setup.py ]; then
-  pip3 install --no-cache-dir --break-system-packages /workspace \
-    || { echo "seal-egress: dependency install from /workspace failed" >&2; exit 1; }
-elif [ -f /workspace/requirements.txt ]; then
-  pip3 install --no-cache-dir --break-system-packages -r /workspace/requirements.txt \
-    || { echo "seal-egress: dependency install from requirements.txt failed" >&2; exit 1; }
+# D32/N1: never `pip install <path>` against the agent-writable workspace -
+# that runs PEP 517 build hooks (setup.py / pyproject.toml [build-system]
+# code) as whatever calls it, and this runs as root, pre-seal, network open.
+# A build hook planted in /workspace (which the agent can freely write) would
+# then run as root with full network access on the container's NEXT start
+# (another run_agent, an egress_sealed(wd), a multi-episode arm) - a
+# complete, reusable defeat of the seal. Verified live: the reviewer's planted
+# hook wrote `uid=0 github_http=200` back into the workspace under the old
+# `pip3 install /workspace` version of this script.
+#
+# collect_deps.py only parses declared metadata (tomllib + line-regex) and
+# never executes anything from the workspace; the names it prints are
+# installed from PyPI by name, never by path. Fails loud - a broken parse or
+# install must not silently proceed.
+deps="$(python3 /usr/local/bin/collect_deps.py /workspace)" \
+  || { echo "seal-egress: dependency name extraction failed" >&2; exit 1; }
+if [ -n "$deps" ]; then
+  # shellcheck disable=SC2086
+  pip3 install --no-cache-dir --break-system-packages $deps \
+    || { echo "seal-egress: dependency install failed" >&2; exit 1; }
 fi
 
 # D25/D29: resolve every A record while still root and network is up, pin
@@ -37,6 +45,27 @@ if [ "$rule_count" -eq 0 ]; then
 fi
 iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A OUTPUT -j DROP
+
+# v6: no legitimate use (Anthropic access above is resolved/pinned as v4
+# only) and no v6 route exists on this host to verify against either way -
+# rather than leave that "unverified, assumed fine", drop all v6 egress
+# unconditionally so it's closed by construction, not by absence of a route.
+ip6tables -A OUTPUT -o lo -j ACCEPT
+ip6tables -A OUTPUT -j DROP
+
+# I3 / HOME+CONFIG: these are container-local now (not bind-mounted - see
+# driver.py), so `mkdir`+`chown` here never touches anything host-visible.
+# Only /workspace remains a bind mount that still needs DAC_OVERRIDE below.
+# Defaulted rather than required (`${VAR:-default}`, safe under `set -u`):
+# this script is the one place that contract has to hold, not every caller
+# of the image - membench/runner.py (Task 4, built on _docker_run/_CAP_ARGS
+# from this file) doesn't set either and broke under `set -u` the first time
+# this was a hard requirement instead of a default.
+HOME="${HOME:-/run/membench/home}"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-/run/membench/config}"
+export HOME CLAUDE_CONFIG_DIR
+mkdir -p "$HOME" "$CLAUDE_CONFIG_DIR"
+chown -R 1000:1000 "$HOME" "$CLAUDE_CONFIG_DIR"
 
 # D23: --inh-caps/--ambient-caps alone do not stop a root process from
 # regaining NET_ADMIN after exec (root gets capabilities from the bounding
@@ -63,17 +92,25 @@ iptables -A OUTPUT -j DROP
 # while running as root/sudo, and this exec is the one place root privilege
 # is still held, so it's dropped for good right here alongside the caps.
 #
-# I3: the bind-mounted workspace/HOME/CONFIG dirs land root:root mode 700
-# through the VM's virtiofs layer, unreachable by uid 1000. A `chmod 0777`
-# on them would "fix" that by mutating the HOST directory's permission bits
-# permanently (same inode, bind mount) - verified, and never reverted after
-# the container exits. Keeping CAP_DAC_OVERRIDE (added to the container's
-# starting caps, never dropped here) instead: it bypasses file/dir
-# permission checks for this process without touching the mode bits at all.
-# Verified: uid 1000 with only DAC_OVERRIDE can read/write/list a 700
-# root-owned directory, and `stat` on that directory from outside the
-# container still shows unchanged "700 root" throughout and after.
+# I3: /workspace lands root:root mode 700 through the VM's virtiofs layer,
+# unreachable by uid 1000. A `chmod 0777` on it would "fix" that by mutating
+# the HOST directory's permission bits permanently (same inode, bind mount) -
+# verified, and never reverted after the container exits. Keeping
+# CAP_DAC_OVERRIDE (added to the container's starting caps, never dropped
+# here) instead: it bypasses file/dir permission checks for this process
+# without touching the mode bits at all. Verified: uid 1000 with only
+# DAC_OVERRIDE can read/write/list a 700 root-owned directory, and `stat` on
+# that directory from outside the container still shows unchanged "700 root"
+# throughout and after. Reconsidered per review round 2: still needed -
+# HOME/CONFIG no longer need it (moved off the bind-mount path above), but
+# /workspace must stay bind-mounted (the harness reads results back from it
+# on the host) and reconciling "agent must run as non-root" with "mount
+# lands root-owned" has no narrower fix than this. Blast radius of the
+# breadth this grants (uid 1000 can rewrite any root-owned file INSIDE the
+# container, e.g. this script's own on-disk copy, /etc/hosts) is contained
+# by --rm: nothing written to container-local paths (as opposed to the
+# /workspace bind mount) survives past this one run.
 exec setpriv --reuid=1000 --regid=1000 --init-groups \
-  --bounding-set=-net_admin,-setpcap,-setuid,-setgid \
-  --inh-caps=-net_admin,-setpcap,-setuid,-setgid,+dac_override \
-  --ambient-caps=-net_admin,-setpcap,-setuid,-setgid,+dac_override "$@"
+  --bounding-set=-net_admin,-setpcap,-setuid,-setgid,-chown \
+  --inh-caps=-net_admin,-setpcap,-setuid,-setgid,-chown,+dac_override \
+  --ambient-caps=-net_admin,-setpcap,-setuid,-setgid,-chown,+dac_override "$@"
