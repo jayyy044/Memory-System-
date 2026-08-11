@@ -14,7 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # applied to test-only tooling that isn't discoverable from a repo's
     # standard [project.dependencies] metadata (liquid declares them under
     # a hatch-specific [tool.hatch.envs.default] block, not PEP 621).
-    && pip3 install --no-cache-dir --break-system-packages pytest pytest-json-report hypothesis mock \
+    # D46: pinned, not floating - scoring must be reproducible run to run.
+    # An unpinned pytest is also exactly what let a new outcome-string
+    # spelling (C1: "subtests passed") appear silently; an unpinned
+    # hypothesis draws different property-test examples on every run
+    # regardless of --hypothesis-seed's determinism for a GIVEN version.
+    && pip3 install --no-cache-dir --break-system-packages \
+         pytest==9.1.1 pytest-json-report==1.5.0 hypothesis==6.165.3 mock==5.2.0 \
     && npm install -g @anthropic-ai/claude-code@2.1.227 \
     && npm cache clean --force
 # claude refuses --dangerously-skip-permissions as root/sudo ("cannot be

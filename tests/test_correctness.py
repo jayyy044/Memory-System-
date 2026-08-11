@@ -1,3 +1,5 @@
+import pytest
+
 from membench.scoring.correctness import score_correctness
 from membench.corpus.extract import BenchTask
 
@@ -37,3 +39,22 @@ def test_missing_node_id_blocks_solved_and_is_not_silently_absent():
     assert s.solved is False
     assert s.missing == ["tests/test_cycle.py::test_empty_group"]
     assert s.p2p_broken == []  # present and True - not a regression
+
+
+@pytest.mark.parametrize("bad_value", [None, 0, "failed", "passed"])
+def test_non_bool_p2p_value_counts_as_broken(bad_value):
+    # D45(b): `results.get(n) is False` let any non-bool value (None, 0, a
+    # bare string) slip past both p2p_broken (not `False`) and missing (not
+    # absent - the key exists) at once, reporting solved=True with a P2P that
+    # never actually reported a real pass. `is not True` closes it: only an
+    # exact True counts as not-broken.
+    s = score_correctness(
+        {
+            "tests/test_cycle.py::test_empty_group": True,
+            "tests/test_cycle.py::test_basic": bad_value,
+        },
+        _task(),
+    )
+    assert s.solved is False
+    assert s.p2p_broken == ["tests/test_cycle.py::test_basic"]
+    assert s.missing == []

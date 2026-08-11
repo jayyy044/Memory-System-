@@ -29,8 +29,13 @@ class CorrectnessScore:
 def score_correctness(results: dict[str, bool], task: BenchTask) -> CorrectnessScore:
     all_ids = task.fail_to_pass + task.pass_to_pass
     missing = [n for n in all_ids if n not in results]
+    # D45(b): `is False` let any non-bool value (None, 0, "failed" - e.g. a
+    # future results dict built by something other than run_tests) slip past
+    # both this check AND the `missing` check above, since it's neither
+    # `False` nor absent. `is not True` closes it: anything that isn't
+    # exactly True counts as broken, same length, no gap.
     f2p_passed = sum(1 for n in task.fail_to_pass if results.get(n) is True)
-    p2p_broken = [n for n in task.pass_to_pass if results.get(n) is False]
+    p2p_broken = [n for n in task.pass_to_pass if n in results and results.get(n) is not True]
     return CorrectnessScore(
         f2p_passed=f2p_passed,
         f2p_total=len(task.fail_to_pass),
