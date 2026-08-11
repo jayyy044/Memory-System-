@@ -1,7 +1,9 @@
 from pathlib import Path
+import pytest
 from membench.driver import run_agent, Transcript
 
 
+@pytest.mark.live
 def test_run_agent_captures_tool_calls(tmp_path: Path):
     (tmp_path / "hello.txt").write_text("marker-9f3a\n")
     t = run_agent(
@@ -17,6 +19,7 @@ def test_run_agent_captures_tool_calls(tmp_path: Path):
     assert any(c.file_path and c.file_path.endswith("hello.txt") for c in t.tool_calls)
 
 
+@pytest.mark.live
 def test_run_agent_captures_result_metadata(tmp_path: Path):
     (tmp_path / "hello.txt").write_text("marker-9f3a\n")
     t = run_agent(

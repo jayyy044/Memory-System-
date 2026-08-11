@@ -65,13 +65,14 @@ def map_issue_to_commit(repo_dir: Path, issue: int) -> str | None:
     result = _one_or_raise(issue, matches)
     if result:
         return result
-    # 3. changelog pickaxe — the commit that added the entry. Multiple hits
-    # here mean the file was touched more than once while the string was
-    # present (e.g. reformatting); take the oldest, which introduced it.
-    # Not the same "guess" as paths 1/2 — the search itself defines "added".
+    # 3. changelog pickaxe — the commit that changed whether the entry is
+    # present. -S reports every commit where the occurrence count changes,
+    # including a removal followed by a re-add (revert, reorg, regression
+    # re-fix) — not just a single clean addition, so multiple hits are
+    # ambiguous the same way paths 1/2 are, not a well-defined "oldest wins".
     shas = _git(repo_dir, "log", "--all", "--format=%H", "-S", f"issues/{issue})", "--", "CHANGES.md")
-    lines = [s for s in shas.splitlines() if s.strip()]
-    return lines[-1] if lines else None
+    matches = [s for s in shas.splitlines() if s.strip()]
+    return _one_or_raise(issue, matches)
 
 
 def changed_files(repo_dir: Path, sha: str, prefix: str = "liquid/") -> list[str]:

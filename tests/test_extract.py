@@ -41,14 +41,32 @@ def _commit(path: Path, filename: str, content: str, message: str) -> None:
     subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", message], check=True)
 
 
+def _init_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+
+
 def test_ambiguous_mapping_raises(tmp_path: Path):
     """Two commits both claim to close the same issue (fix + later regression
     fix) — the function must surface this rather than silently pick the
     newest one."""
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    _init_repo(tmp_path)
     _commit(tmp_path, "a.txt", "1", "fixes #7 first attempt")
     _commit(tmp_path, "a.txt", "2", "fixes #7 for real this time")
     with pytest.raises(AmbiguousMapping):
         map_issue_to_commit(tmp_path, 7)
+
+
+def test_ambiguous_pickaxe_raises(tmp_path: Path):
+    """Changelog entry added, removed, then re-added (revert / reorg /
+    regression re-fix) — pickaxe hits more than one commit, and the oldest
+    is not necessarily the one the current CHANGES.md traces to. Must raise,
+    not silently return the oldest hit. Commit messages avoid path 1/2's
+    trigger words so path 3 is actually reached."""
+    _init_repo(tmp_path)
+    _commit(tmp_path, "CHANGES.md", "- entry for issues/9)\n", "update changelog")
+    _commit(tmp_path, "CHANGES.md", "- unrelated\n", "reorganize changelog")
+    _commit(tmp_path, "CHANGES.md", "- entry for issues/9) again\n", "restore changelog entry")
+    with pytest.raises(AmbiguousMapping):
+        map_issue_to_commit(tmp_path, 9)
