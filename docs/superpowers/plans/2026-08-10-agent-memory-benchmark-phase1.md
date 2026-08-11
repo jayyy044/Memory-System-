@@ -550,6 +550,13 @@ git commit -m "feat: sealed workspace provisioning with leak verification"
 
 ### Task 4: Test runner and correctness scoring
 
+**Runs inside the sealed container, not on the host (D30).** Two reasons: liquid's
+dependencies are installed by the container entrypoint, so a host-side `pytest` hits the same
+113 `ModuleNotFoundError` that Task 13 fixed; and scoring must run in the same environment the
+agent ran in, or a pass/fail verdict does not correspond to what the agent actually
+experienced. Reuse Task 13's image and egress seal — scoring needs no network at all, so it
+may run with the seal fully closed.
+
 **Files:**
 - Create: `membench/runner.py`
 - Create: `membench/scoring/correctness.py`
