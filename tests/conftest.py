@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from membench.corpus.extract import BenchTask, map_issue_to_commit, changed_files, base_sha
+from membench.workspace import provision
 
 LIQUID = Path("fixtures/liquid")
 ISSUE = 209
@@ -34,3 +35,10 @@ def sample_task(liquid_repo: Path) -> BenchTask:
         fix_sha=fix_sha,
         changed_files=changed_files(liquid_repo, fix_sha),
     )
+
+
+@pytest.fixture(scope="session")
+def provisioned_workdir(sample_task: BenchTask, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Session-scoped (like sample_task) so the sealed clone + container
+    dependency install only happens once for the whole runner test module."""
+    return provision(sample_task, tmp_path_factory.mktemp("membench-ws"))
