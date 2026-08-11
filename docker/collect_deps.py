@@ -20,6 +20,13 @@ Only tomllib (stdlib, pure parsing, no code execution) and line-regex
 matching are used here. Prints one pip-installable specifier per line,
 whitespace-free, so the caller can feed them to `pip install -r` with no
 shell word-splitting involved at all.
+
+Scope: this reads ONLY [project.dependencies] and requirements.txt - not
+[build-system].requires, [project.optional-dependencies], setup.cfg,
+Pipfile, or [tool.poetry.dependencies]. Those are not attack vectors (never
+read, so nothing in them reaches pip), but a corpus repo that declares its
+deps only in one of them will have them silently not installed - that looks
+like a broken repo, not a harness limitation, unless you already know this.
 """
 import re
 import sys

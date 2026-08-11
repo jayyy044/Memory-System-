@@ -26,8 +26,16 @@ set -eu
 deps_file=/run/membench-deps.txt
 python3 /usr/local/bin/collect_deps.py /workspace > "$deps_file" \
   || { echo "seal-egress: dependency name extraction failed" >&2; exit 1; }
+# D41: --only-binary=:all: forbids pip from falling back to an sdist for
+# ANY of these names. A validated spec is a NAME, not a promise of a wheel -
+# an sdist install runs that package's setup.py, and this call is still
+# root, pre-seal, network open. Without this flag, a workspace declaring the
+# fully-valid `dependencies = ["sgmllib3k"]` (no wheel on PyPI) makes pip
+# fetch the sdist and execute its setup.py as root before the seal is up -
+# reviewer-demonstrated. This can fail an install that would have succeeded
+# via sdist; that is the intended tradeoff, not a bug to work around.
 if [ -s "$deps_file" ]; then
-  pip3 install --no-cache-dir --break-system-packages -r "$deps_file" \
+  pip3 install --no-cache-dir --break-system-packages --only-binary=:all: -r "$deps_file" \
     || { echo "seal-egress: dependency install failed" >&2; exit 1; }
 fi
 

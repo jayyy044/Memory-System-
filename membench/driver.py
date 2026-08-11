@@ -144,7 +144,13 @@ def _docker_run(
     world-readable in host `ps` and, verified, ends up inside
     subprocess.TimeoutExpired (`token in repr(e.cmd)` was True) which this
     function re-raises. The re-raise is scrubbed as well, so a future caller
-    that puts a secret back on argv still cannot leak it through here."""
+    that puts a secret back on argv still cannot leak it through default
+    traceback rendering (format_exception respects __suppress_context__).
+    That guarantee does not extend to code that walks __context__ directly -
+    a structured logger or Sentry-style capture would still see the
+    unscrubbed original in e.__context__, since `raise ... from None` only
+    hides it from the default renderer, not from the object graph. No
+    caller does this today."""
     name = f"membench-{uuid.uuid4().hex[:12]}"
     cmd = ["docker", "run", "--rm", "--name", name, *args]
     try:
