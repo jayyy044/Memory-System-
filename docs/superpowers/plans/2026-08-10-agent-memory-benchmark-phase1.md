@@ -525,9 +525,19 @@ def verify_sealed(workdir: Path) -> list[str]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_workspace.py -v`
-Expected: PASS (4 passed)
+Expected: PASS
 
-If `--revision` is unsupported by the installed git, substitute `--branch <base_sha>`; if that also fails, clone `--depth 1` at the default branch then `git fetch --depth 1 origin <base_sha> && git checkout FETCH_HEAD` before removing the remote.
+**`--branch <base_sha>` is NOT a valid fallback** — `--branch` takes a ref name, never a
+commit SHA (`fatal: Remote branch <sha> not found in upstream origin`). If `--revision` is
+unsupported by the installed git, clone `--depth 1` at the default branch, then
+`git fetch --depth 1 origin <base_sha> && git checkout FETCH_HEAD`, then **prune every
+remaining ref and `git gc --prune=now`** — the fetch path leaves `refs/heads/<default>`
+alive, which makes the fix commit reachable and readable via `git diff`.
+
+**Anything that rewrites history in the workspace must purge the rewritten objects.**
+`git commit --amend` alone leaves the pre-amend commit as a loose object, so content
+removed from `HEAD` stays readable at the old SHA. Amend must be followed by
+`git reflog expire --expire=now --all` and `git gc --prune=now`.
 
 - [ ] **Step 5: Commit**
 
