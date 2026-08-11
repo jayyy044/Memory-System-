@@ -4,7 +4,39 @@ from pathlib import Path
 import pytest
 
 from membench.corpus.extract import BenchTask
-from membench.runner import RunTestsError, run_tests
+from membench.runner import RunTestsError, _test_passed, run_tests
+
+
+# S5: exercises the outcome mapping DIRECTLY, with no docker/pytest run
+# involved - the round-1 "mystery_outcome scores False" claim wasn't
+# reproducible through the shipped code path, because a planted conftest.py
+# is exactly what the R2 delete-pass removes before the mapping is ever
+# reached; that could only prove the delete-pass works, not the mapping.
+# These fail immediately if `_PASSING_OUTCOMES` is ever reverted to a
+# denylist (`not in {"failed", "error"}` would make "mystery_outcome" -> True).
+def test_test_passed_rejects_unknown_outcome():
+    assert _test_passed({"outcome": "mystery_outcome"}) is False
+
+
+def test_test_passed_accepts_known_passing_outcomes():
+    for outcome in ("passed", "skipped", "subtests passed", "xfailed"):
+        assert _test_passed({"outcome": outcome}) is True
+
+
+def test_test_passed_rejects_xpassed():
+    assert _test_passed({"outcome": "xpassed"}) is False
+
+
+def test_test_passed_catches_seeded_passed_behind_raw_call_failure():
+    # S4: pytest-json-report seeds a test item's outcome optimistically as
+    # "passed" and only overwrites it when pytest_report_teststatus returns
+    # something other than "passed"/"" - a hook returning "" for a genuinely
+    # failing test leaves the top-level field reading "passed", a string
+    # identical to a real pass. The raw per-phase outcome (pytest core, set
+    # before that hook ever runs) still says "failed".
+    assert _test_passed({"outcome": "passed", "call": {"outcome": "failed"}}) is False
+    assert _test_passed({"outcome": "passed", "setup": {"outcome": "failed"}}) is False
+    assert _test_passed({"outcome": "passed", "call": {"outcome": "passed"}}) is True
 
 
 def test_run_tests_reports_per_test_results(sample_task: BenchTask, provisioned_workdir: Path):
@@ -91,6 +123,68 @@ def test_planted_conftest_cannot_force_solved(sample_task: BenchTask, provisione
     results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"])
     assert results["tests/test_issues.py::test_issue_209"] is False
     assert not conftest.exists(), "the planted conftest.py must be deleted, not merely outvoted"
+
+
+def test_planted_post_checkout_hook_does_not_execute(sample_task: BenchTask, provisioned_workdir: Path):
+    # S1/D52: CRITICAL - the previous mechanism (`git checkout FETCH_HEAD --
+    # <paths>`, host-side, against an agent-writable repo) fires
+    # post-checkout, executing a planted hook as this HOST process - outside
+    # the container, outside the egress seal, with full network. Verified
+    # independently (see task-4-report.md) that plain `git checkout <ref> --
+    # path` fires the hook and `git cat-file -p` does not; this exercises
+    # the actual run_tests() path end to end.
+    task = _issue_209_task(sample_task)
+    hooks_dir = provisioned_workdir / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-checkout"
+    marker = provisioned_workdir / ".hook-fired"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    try:
+        run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"])
+        assert not marker.exists(), "post-checkout hook must never execute during host-side restoration"
+    finally:
+        hook.unlink()
+        marker.unlink(missing_ok=True)
+
+
+def test_modified_test_init_cannot_force_solved(sample_task: BenchTask, provisioned_workdir: Path):
+    # S2/D53: name-based matching missed tests/__init__.py entirely (present
+    # in gold - liquid ships an empty one - so the old restore-only-what-
+    # exists pass never touched it, and it doesn't look like a test file by
+    # name so the old delete pass never removed an agent-modified one
+    # either). pytest imports it for every tests/* module. Demonstrated live:
+    # monkeypatching `_pytest.python.Function.runtest` from inside it scored
+    # solved=True with the file still present. Path-based matching (any file
+    # under a "test root" directory, not just filename-matched ones) closes
+    # this - restores it to gold's (empty) content regardless of its name.
+    task = _issue_209_task(sample_task)
+    init_file = provisioned_workdir / "tests" / "__init__.py"
+    init_file.write_text(
+        "import _pytest.python\n"
+        "_pytest.python.Function.runtest = lambda self: None\n"
+    )
+    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"])
+    assert results["tests/test_issues.py::test_issue_209"] is False
+    assert init_file.read_text() == "", "must be restored to gold's (empty) content, not merely outvoted"
+
+
+def test_frozen_deps_ignore_tampered_requirements_txt(sample_task: BenchTask, provisioned_workdir: Path):
+    # S3/D54: liquid's base_sha has no requirements.txt at all, so the
+    # frozen dependency set (extracted from base_sha, not live /workspace)
+    # must not include this poisoned one. If scoring re-derived from the
+    # live workspace instead (the bug), `pip install` would try to fetch a
+    # package that doesn't exist on PyPI and the container would exit before
+    # ever writing a report - run_tests would raise. A clean, real result
+    # coming back proves the tampered file was never consulted.
+    task = _issue_209_task(sample_task)
+    poison = provisioned_workdir / "requirements.txt"
+    poison.write_text("totally-nonexistent-package-membench-probe-xyz==99.0.0\n")
+    try:
+        results = run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"])
+    finally:
+        poison.unlink()
+    assert results, "scoring must use the base_sha-frozen dependency set, not the agent's tampered requirements.txt"
 
 
 @pytest.fixture()

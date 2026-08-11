@@ -2,12 +2,20 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 
 from membench.corpus.extract import BenchTask
 from membench.driver import _CAP_ARGS, _CONTAINER_WORKDIR, _docker_run, _ensure_image
 from membench.workspace import _submodule_paths
+
+# S3/D54: docker/collect_deps.py, reused (not reimplemented) - same
+# validated-PEP-508 parser, run on the HOST against a frozen base_sha
+# snapshot instead of inside the container against /workspace.
+_COLLECT_DEPS_SCRIPT = Path(__file__).resolve().parent.parent / "docker" / "collect_deps.py"
+_CONTAINER_FROZEN_DEPS = "/run/membench/deps/frozen-deps.txt"
 
 # R2/D50: a trusted config file baked into the image (never the bind-mounted
 # /workspace) so a workspace pyproject.toml's [tool.pytest.ini_options] /
@@ -16,6 +24,24 @@ from membench.workspace import _submodule_paths
 # live: addopts = "--collect-only" in a workspace pyproject.toml silently
 # turned every scored run into a no-op without `-c`; tests actually execute
 # with it present.
+#
+# JUDGEMENT CALL (fix round 3, reviewer-requested): this hard substitution
+# also discards LEGITIMATE gold ini settings a real repo might declare -
+# asyncio_mode, filterwarnings, markers, testpaths, xfail_strict. liquid
+# needs none of these, so this is genuinely untested against a repo that
+# does. Decision: keep the hard substitution rather than merge gold's ini
+# keys in. Reasons: (1) a safe merge means parsing THREE dialects
+# (pyproject.toml's [tool.pytest.ini_options] is TOML; pytest.ini/tox.ini/
+# setup.cfg are INI) while explicitly excluding `addopts` specifically -
+# that's new parsing surface introduced under an already-dense review round,
+# and getting the exclusion subtly wrong reopens exactly what `-c` exists to
+# close; (2) the failure mode of NOT merging is the fail-closed, visible
+# kind (a repo needing asyncio_mode collects/runs its async tests oddly,
+# operator sees implausible results and investigates) rather than a silent
+# miscategorization - the same "recoverable over silent" tradeoff R1 already
+# made. Tracked as a named limitation: a corpus repo whose test suite
+# depends on pytest.ini/pyproject.toml settings beyond defaults needs this
+# revisited before onboarding, not discovered by a wrong score.
 _TRUSTED_PYTEST_INI = "/usr/local/etc/membench-pytest.ini"
 
 # D30: pytest runs INSIDE the sealed container, not on the host. Two reasons:
@@ -67,80 +93,157 @@ class RunTestsError(RuntimeError):
 # flakiness). Fail-closed applies here too: uncertain -> not-passed.
 _PASSING_OUTCOMES = {"passed", "skipped", "subtests passed", "xfailed"}
 
-# R2/D50: paths whose mere PRESENCE lets code run or settings apply outside
-# pytest's own `-c`-controlled ini (conftest.py at any level - pytest always
-# imports these regardless of ini source; sitecustomize.py - the interpreter
+# S4: pytest-json-report seeds a test item's top-level `outcome` optimistically
+# as "passed" (serialize.make_testitem) and only overwrites it when
+# `pytest_report_teststatus` - a firstresult hook, so any ONE plugin can
+# supply the answer for everyone - returns something other than "passed"/""
+# (plugin.py's pytest_runtest_logreport: `if outcome not in ['passed', ''])`.
+# A plugin (registered from a dependency, not just a conftest.py file - S3
+# closes the delivery vector for OUR corpus but this is a mapping-level gap
+# independent of how the hook got there) returning "" for a genuinely
+# failing test leaves the top-level field reading "passed" - a string
+# IDENTICAL to a real pass; no allowlist tuning can tell them apart from
+# that field alone. `report.outcome`, embedded per-phase (setup/call/
+# teardown) via `make_teststage`, is different: it's pytest CORE's own
+# TestReport.outcome, set in `pytest_runtest_makereport` BEFORE
+# pytest_report_teststatus ever runs, and is not itself passed through that
+# hook. Cross-checking against it defeats a hook that only manipulates the
+# top-level categorization.
+def _test_passed(test: dict) -> bool:
+    if test.get("outcome") not in _PASSING_OUTCOMES:
+        return False
+    return not any(test.get(stage, {}).get("outcome") == "failed" for stage in ("setup", "call", "teardown"))
+
+# S2/D53: standalone config-shaped filenames, matched anywhere in the tree
+# regardless of directory - conftest.py at any level (pytest always imports
+# these regardless of ini source); sitecustomize.py (the interpreter
 # auto-imports this from any dir on sys.path, and /workspace is on sys.path
-# by construction; pytest.ini/tox.ini/setup.cfg - belt-and-suspenders on top
-# of `-c`, in case anything ever invokes pytest without it) plus the test
-# files themselves (D45(a), unchanged from last round).
+# by construction); pytest.ini/tox.ini/setup.cfg (belt-and-suspenders on top
+# of `-c`, in case anything ever invokes pytest without it).
 _DISCARD_NAMES = {"conftest.py", "sitecustomize.py", "pytest.ini", "tox.ini", "setup.cfg"}
 
 
-def _looks_like_test_surface(path: str) -> bool:
+def _is_test_named(path: str) -> bool:
     name = Path(path).name
-    return name in _DISCARD_NAMES or name.startswith("test_") or name.endswith("_test.py")
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _looks_like_config_name(path: str) -> bool:
+    return Path(path).name in _DISCARD_NAMES
+
+
+def _cat_file(workdir: Path, ref: str, path: str) -> bytes | None:
+    """S1: a pure object-database read - no hooks, no smudge/clean filters
+    (those only apply during working-tree materialization, i.e. checkout/
+    merge/add, never a blob read). Returns None if `path` doesn't exist at
+    `ref` (mirrors collect_deps.py's own `if path.exists()` pattern)."""
+    r = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-p", f"{ref}:{path}"],
+        cwd=workdir, capture_output=True,
+    )
+    return r.stdout if r.returncode == 0 else None
+
+
+def _frozen_deps_file(workdir: Path, task: BenchTask, scratch: Path) -> Path:
+    """S3/D54: dependency install at SCORING time must not be re-derived from
+    the agent's (possibly tampered) live workspace - demonstrated: a
+    workspace requirements.txt of `pytest-timeout==2.3.1` registered a
+    plugin inside the scoring run, and `pytest==7.4.4` DOWNGRADED the
+    scorer's own pinned pytest. Freezes the dependency set from
+    task.base_sha instead - what was actually on disk when the agent's
+    episode started, extracted via the same hook-free `_cat_file` blob read
+    (no fetch needed, base_sha's commit is already in this repo's local
+    object database) - and runs collect_deps.py's SAME validated-PEP-508
+    parser against that frozen snapshot rather than /workspace. Safe to run
+    on the host (not root, no pip, tomllib+regex only, same as always)."""
+    for name in ("pyproject.toml", "requirements.txt"):
+        blob = _cat_file(workdir, task.base_sha, name)
+        if blob is not None:
+            (scratch / name).write_bytes(blob)
+    proc = subprocess.run(
+        [sys.executable, str(_COLLECT_DEPS_SCRIPT), str(scratch)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RunTestsError(f"failed to freeze scoring dependency set from base_sha: {proc.stderr}")
+    deps_file = scratch / "frozen-deps.txt"
+    deps_file.write_text(proc.stdout)
+    return deps_file
 
 
 def _reset_test_surface(workdir: Path, task: BenchTask, *, url: str | None = None) -> None:
-    """D45(a) + R2/D50: an agent's edits to SOURCE carry into scoring; its
-    edits to anything pytest itself loads (tests, conftest.py, pytest
-    config files, sitecustomize.py) do not. Two passes:
+    """D45(a) + R2/S2: an agent's edits to SOURCE carry into scoring; its
+    edits to anything pytest itself loads (tests, conftest.py, pytest config
+    files, sitecustomize.py) do not.
 
-    1. Checkout every such path PRESENT in the gold tree at task.fix_sha
-       (unchanged from last round) - restores tampered gold tests, recreates
-       deleted ones.
-    2. NEW: delete every such path found ANYWHERE in the current tree that
-       is NOT one of the gold paths just restored. Pass 1 alone only
-       overwrites paths gold already has; liquid's gold tree has no
-       conftest.py and no pytest.ini at all, so an agent-CREATED root
-       conftest.py (e.g. a `pytest_report_teststatus` hook returning the
-       literal string "passed" for everything, or `pytest_collection_
-       modifyitems` skip-marking every item) previously survived pass 1
-       entirely and scored solved=True with zero source change - demonstrated
-       live, see task-4-report.md.
+    S2/D53: matches by PATH, not filename. `_is_test_named` only bootstraps
+    which top-level directories ARE "test roots" (any dir gold puts a
+    test_*.py/*_test.py file under, e.g. "tests") - every file under a test
+    root is then in scope regardless of its own name. Filename-only matching
+    missed `tests/__init__.py` (present in gold, so pass 1 never touched it,
+    pass 2 never deleted it) even though pytest imports it for every
+    `tests/*` module - demonstrated live: monkeypatching
+    `_pytest.python.Function.runtest` from inside it scored solved=True with
+    the file still present. Any module a gold test imports is test surface,
+    named like a test or not.
 
-    Runs on the HOST (plain git/filesystem ops, no pytest needed) and BEFORE
-    the container starts. Fetching task.fix_sha here is not a seal
-    violation: the agent's run has already ended by the time scoring runs,
-    so there is no further turn for a leaked "future" to reach.
+    S1/D52: CRITICAL, fixed this round - the previous version used
+    `git checkout FETCH_HEAD -- <paths>` here, on the HOST, against an
+    agent-writable repository. Pathspec checkouts fire `post-checkout`, so a
+    planted `.git/hooks/post-checkout` executed as this host process (uid
+    501) - outside the container, outside the egress seal, with full
+    network - on every scoring run; demonstrated overwriting the
+    just-restored gold test right back to `assert True`. Every git
+    invocation below passes `-c core.hooksPath=/dev/null` (defence in
+    depth - a repo-local `core.hooksPath` override in the agent's own
+    `.git/config` must not re-enable this), but the actual fix is that
+    nothing here EVER checks out a working tree from an untrusted ref
+    anymore: gold content is extracted blob-by-blob via `git cat-file -p`
+    (no hooks, no smudge/clean filters - see `_cat_file`) and written with
+    plain `Path.write_bytes`, never through git's checkout machinery.
+
+    Runs on the HOST and BEFORE the container starts. Fetching task.fix_sha
+    here is not a seal violation: the agent's run has already ended by the
+    time scoring runs, so there is no further turn for a leaked "future" to
+    reach.
     """
     remote = "membench-gold"
     clone_url = url or f"https://github.com/{task.repo}.git"  # url= override for tests only, mirrors workspace.provision's own shape
+    git_safe = ["-c", "core.hooksPath=/dev/null"]  # S1 defence in depth (primary fix: no checkout below at all)
     subprocess.run(
-        ["git", "remote", "add", remote, clone_url],
+        ["git", *git_safe, "remote", "add", remote, clone_url],
         cwd=workdir, check=True, capture_output=True,
     )
     try:
         subprocess.run(
-            ["git", "fetch", "-q", "--depth", "1", remote, task.fix_sha],
+            ["git", *git_safe, "fetch", "-q", "--depth", "1", remote, task.fix_sha],
             cwd=workdir, check=True, capture_output=True,
         )
-        gold_paths = {
-            p for p in subprocess.run(
-                ["git", "ls-tree", "-r", "--name-only", "FETCH_HEAD"],
-                cwd=workdir, capture_output=True, text=True, check=True,
-            ).stdout.splitlines()
-            if _looks_like_test_surface(p)
+        gold_paths_all = subprocess.run(
+            ["git", *git_safe, "ls-tree", "-r", "--name-only", "FETCH_HEAD"],
+            cwd=workdir, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        test_roots = {p.split("/", 1)[0] for p in gold_paths_all if _is_test_named(p)}
+        gold_surface = {
+            p for p in gold_paths_all
+            if p.split("/", 1)[0] in test_roots or _looks_like_config_name(p)
         }
-        if gold_paths:
-            # Restores content for paths that still exist AND recreates any
-            # gold test file the agent deleted - `git checkout <ref> -- path`
-            # accepts a path absent from the working tree as long as it's
-            # present in the given ref's tree, which it is here by construction.
-            subprocess.run(
-                ["git", "checkout", "FETCH_HEAD", "--", *sorted(gold_paths)],
-                cwd=workdir, check=True, capture_output=True,
-            )
+        for rel in sorted(gold_surface):
+            blob = _cat_file(workdir, "FETCH_HEAD", rel)
+            if blob is None:
+                continue  # shouldn't happen - rel came from this same tree - but never crash restoration over one path
+            dest = workdir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(blob)
     finally:
-        subprocess.run(["git", "remote", "remove", remote], cwd=workdir, check=False, capture_output=True)
+        subprocess.run(["git", *git_safe, "remote", "remove", remote], cwd=workdir, check=False, capture_output=True)
 
-    # `gold_paths` (superproject `git ls-tree -r`) never descends into a
+    # `gold_surface` (superproject `git ls-tree -r`) never descends into a
     # submodule's own working tree - git treats a submodule as a single
     # "commit" entry, not expanded into its files. os.walk knows nothing
     # about that boundary, so without this exclusion the delete pass could
-    # wipe legitimate content a submodule happens to name test_*.py/
-    # conftest.py - same submodule-boundary precedent as workspace.py's own
+    # wipe legitimate content a submodule happens to share a test-root name
+    # with - same submodule-boundary precedent as workspace.py's own
     # instruction-file walk.
     sub_dirs = _submodule_paths(workdir)
     for root, dirnames, filenames in os.walk(workdir):
@@ -153,7 +256,8 @@ def _reset_test_surface(workdir: Path, task: BenchTask, *, url: str | None = Non
         for name in filenames:
             full = root_path / name
             rel = full.relative_to(workdir).as_posix()
-            if _looks_like_test_surface(rel) and rel not in gold_paths:
+            in_surface = rel.split("/", 1)[0] in test_roots or _looks_like_config_name(rel)
+            if in_surface and rel not in gold_surface:
                 full.unlink()
 
 
@@ -200,17 +304,25 @@ def run_tests(
     if node_ids:
         cmd.extend(node_ids)
 
-    proc = _docker_run(
-        [
-            *_CAP_ARGS,
-            "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
-            "-e", "TZ=UTC",
-            "-e", "PYTHONDONTWRITEBYTECODE=1",
-            image,
-            *cmd,
-        ],
-        timeout_s=1800,
-    )
+    # S3/D54: mount the frozen (base_sha) dependency spec on its own
+    # read-only path outside /workspace, and point seal-egress.sh at it via
+    # env var - the entrypoint installs THIS instead of re-deriving from the
+    # agent's live (possibly tampered) /workspace when the var is set.
+    with tempfile.TemporaryDirectory(prefix="membench-deps-") as deps_scratch:
+        deps_file = _frozen_deps_file(workdir, task, Path(deps_scratch))
+        proc = _docker_run(
+            [
+                *_CAP_ARGS,
+                "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
+                "-v", f"{deps_scratch}:/run/membench/deps:ro",
+                "-e", f"MEMBENCH_FROZEN_DEPS={_CONTAINER_FROZEN_DEPS}",
+                "-e", "TZ=UTC",
+                "-e", "PYTHONDONTWRITEBYTECODE=1",
+                image,
+                *cmd,
+            ],
+            timeout_s=1800,
+        )
 
     # R4/D51: hypothesis (baked into the image, D46) drops a `.hypothesis/`
     # example database into the bind mount on every run regardless of
@@ -219,10 +331,10 @@ def run_tests(
     # already makes example generation deterministic per run; unproven
     # hazard, 3 matched runs during review), but cheap to close - same
     # cleanup shape as the JSON report file below.
-    # ponytail: does not clean the working tree's git-dirty state left by
-    # `_reset_test_surface`'s checkout (`M tests/...`) - cosmetic (doesn't
+    # ponytail: does not clean up the working tree's git-dirty state left by
+    # `_reset_test_surface`'s writes (`M tests/...`) - cosmetic (doesn't
     # execute anything, scoring already re-runs `_reset_test_surface` fresh
-    # on every call), upgrade to `git checkout -- .` here first if a
+    # on every call), upgrade to a plain-filesystem reset here first if a
     # multi-episode re-scoring use case ever depends on a clean tree.
     shutil.rmtree(workdir / ".hypothesis", ignore_errors=True)
 
@@ -236,7 +348,7 @@ def run_tests(
     finally:
         report_host.unlink(missing_ok=True)
 
-    results = {t["nodeid"]: t["outcome"] in _PASSING_OUTCOMES for t in data.get("tests", [])}
+    results = {t["nodeid"]: _test_passed(t) for t in data.get("tests", [])}
 
     requested_exact = [n for n in (node_ids or []) if "::" in n]
     missing = [n for n in requested_exact if n not in results]

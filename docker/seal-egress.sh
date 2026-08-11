@@ -23,9 +23,26 @@ set -eu
 # every entry that is not a plain PEP 508 name/extras/version spec (from
 # BOTH pyproject.toml and requirements.txt - validating only the latter is
 # what left this hole open twice).
-deps_file=/run/membench-deps.txt
-python3 /usr/local/bin/collect_deps.py /workspace > "$deps_file" \
-  || { echo "seal-egress: dependency name extraction failed" >&2; exit 1; }
+# S3/D54: at SCORING time, membench/runner.py sets MEMBENCH_FROZEN_DEPS to a
+# file it already validated on the HOST (via this same collect_deps.py,
+# reused) from task.base_sha - what was on disk before the agent's episode
+# started - and mounts it read-only outside /workspace. When present, install
+# THAT instead of re-deriving from /workspace: re-deriving at scoring time
+# means the agent's own requirements.txt/pyproject.toml edits register
+# whatever they want as root, pre-seal, in the SAME container that then
+# scores the agent's own work - demonstrated, a workspace requirements.txt of
+# `pytest-timeout==2.3.1` registered a plugin inside the scoring run, and
+# `pytest==7.4.4` downgraded the image's pinned pytest outright. run_agent's
+# own container never sets this var, so its behavior (derive from the live,
+# agent-editable /workspace - the agent needs this to run its own pytest
+# during the episode) is unchanged.
+if [ -n "${MEMBENCH_FROZEN_DEPS:-}" ] && [ -f "$MEMBENCH_FROZEN_DEPS" ]; then
+  deps_file="$MEMBENCH_FROZEN_DEPS"
+else
+  deps_file=/run/membench-deps.txt
+  python3 /usr/local/bin/collect_deps.py /workspace > "$deps_file" \
+    || { echo "seal-egress: dependency name extraction failed" >&2; exit 1; }
+fi
 # D41: --only-binary=:all: forbids pip from falling back to an sdist for
 # ANY of these names. A validated spec is a NAME, not a promise of a wheel -
 # an sdist install runs that package's setup.py, and this call is still
