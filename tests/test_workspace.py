@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+import membench.workspace as workspace
 from membench.corpus.extract import BenchTask
 from membench.workspace import (
     provision,
@@ -286,3 +287,57 @@ def test_removes_symlink_to_directory_without_crashing(tmp_path: Path):
 
     assert not (dest / ".claude").exists()
     assert (dest / "real.py").exists()
+
+
+# --- M1: task.repo is the real source, url= is a test-only override --------
+
+def test_provision_derives_url_from_task_repo_unless_overridden(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_clone_at(url, sha, dest, **kwargs):
+        calls.append(url)
+        raise RuntimeError("stop before any real git work — only the URL choice is under test")
+
+    monkeypatch.setattr(workspace, "_clone_at", fake_clone_at)
+    task = BenchTask(
+        task_id="t", repo="octocat/Hello-World", issue_number=1, issue_title="",
+        issue_body="", base_sha="deadbeef", fix_sha="0" * 40, changed_files=[],
+    )
+
+    try:
+        provision(task, tmp_path / "ws-a")
+    except RuntimeError:
+        pass
+    assert calls[-1] == "https://github.com/octocat/Hello-World.git", \
+        "task.repo must be the source when url= is not given"
+
+    try:
+        provision(task, tmp_path / "ws-b", url="https://example.com/explicit.git")
+    except RuntimeError:
+        pass
+    assert calls[-1] == "https://example.com/explicit.git", "an explicit url= must still win"
+
+
+# --- case sensitivity: does a tracked `Claude.md` survive stripping? -------
+
+def test_case_variant_instruction_filename_is_still_stripped(tmp_path: Path):
+    """macOS's default filesystem is case-insensitive; rglob('CLAUDE.md') is
+    a literal (non-wildcard) pattern, so pathlib resolves it via a direct
+    filesystem probe that inherits that case-insensitivity. Verified: this
+    strips a tracked `Claude.md` on this machine. Kept as a real test, not
+    an inference, since the answer is filesystem-dependent."""
+    src = tmp_path / "src8"
+    _init_local_repo(src)
+    (src / "Claude.md").write_text("the fix is in loop.py")
+    (src / "real.py").write_text("x = 1\n")
+    sha = _seed_commit(src)
+
+    dest = tmp_path / "ws8"
+    _clone_at(str(src), sha, dest)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
+    _seal_repo(dest)
+
+    assert not (dest / "Claude.md").exists()
+    show = subprocess.run(["git", "show", "HEAD:Claude.md"], cwd=dest, capture_output=True, text=True)
+    assert show.returncode != 0
+    assert verify_sealed(dest) == []

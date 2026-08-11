@@ -59,7 +59,17 @@ def _clone_at(url: str, sha: str, dest: Path, *, force_fallback: bool = False) -
     D16: `--branch` can never take a raw SHA, so that path is dead and
     dropped. Only two strategies remain: --revision (works on this git,
     2.55.0), or clone-default + targeted fetch + checkout, with every ref
-    pruned and the object database gc'd afterward (D12/D16 corrected)."""
+    pruned and the object database gc'd afterward (D12/D16 corrected).
+
+    M2: for a LOCAL filesystem `url`, git's local-clone optimization silently
+    ignores --depth (no .git/shallow, full object history copied over) even
+    though this --revision path still returns success and a single-ref view.
+    A local-path workspace is not left leaky by this: verify_sealed's C3
+    object-database count (not just ref/log enumeration) still catches the
+    extra commit objects and provision() still raises — but that raise looks
+    unrelated to its actual cause unless you know this. Test fixtures using a
+    local `url=` happen to have exactly one commit, so this has never fired
+    here, but a real local source with more than one commit will hit it."""
     if not force_fallback:
         r = subprocess.run(
             ["git", "clone", "--depth", "1", "--no-tags", "--revision", sha, url, str(dest)],
@@ -186,11 +196,17 @@ def _seal_repo(repo_dir: Path) -> bool:
     return True
 
 
-def provision(task: BenchTask, dest: Path, *, url: str = UPSTREAM) -> Path:
+def provision(task: BenchTask, dest: Path, *, url: str | None = None) -> Path:
+    """M1: one source of truth for the clone URL, in priority order:
+    explicit `url=` (tests only) > `task.repo` (the real corpus signal) >
+    hardcoded UPSTREAM as a last resort when `task.repo` is empty. Before
+    this, `task.repo` was silently ignored, so a second corpus repo would
+    provision the wrong workspace with no indication why."""
+    clone_url = url or (f"https://github.com/{task.repo}.git" if task.repo else UPSTREAM)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         shutil.rmtree(dest)
-    _clone_at(url, task.base_sha, dest)
+    _clone_at(clone_url, task.base_sha, dest)
     subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
     _provision_submodules(dest)
     _seal_repo(dest)
