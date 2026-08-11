@@ -1,6 +1,33 @@
 import subprocess
 from pathlib import Path
-from membench.workspace import provision, verify_sealed
+from membench.workspace import (
+    provision,
+    verify_sealed,
+    UPSTREAM,
+    _clone_at,
+    _provision_submodules,
+    _strip_instruction_files,
+)
+
+# golden-liquid tip at the fix commit — the post-fix oracle a leaking
+# submodule would expose (D15). Pinned commit at sample_task.base_sha is
+# b6386e7adf964517546fec6564ef36e12c4b498e (verified against the real repo).
+GOLDEN_LIQUID_POST_FIX_TIP = "65c2f76ea64ef20647c295b000df5fcd9fc471cd"
+GOLDEN_LIQUID_PINNED = "b6386e7adf964517546fec6564ef36e12c4b498e"
+
+
+def _init_local_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+
+
+def _seed_commit(path: Path) -> str:
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "seed"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
 
 
 def test_workspace_has_no_future_history(sample_task, tmp_path: Path):
@@ -28,3 +55,132 @@ def test_verify_sealed_flags_planted_leak(sample_task, tmp_path: Path):
 def test_verify_sealed_clean_workspace(sample_task, tmp_path: Path):
     wd = provision(sample_task, tmp_path / "ws")
     assert verify_sealed(wd) == []
+
+
+# --- C1: submodule pinned to base_sha, post-fix oracle unreachable ---------
+
+def test_submodule_pinned_to_base_sha_not_default_tip(sample_task, tmp_path: Path):
+    wd = provision(sample_task, tmp_path / "ws")
+    sub = wd / "tests" / "golden-liquid"
+    pinned_in_tree = subprocess.run(
+        ["git", "ls-tree", "HEAD", "--", "tests/golden-liquid"], cwd=wd,
+        capture_output=True, text=True, check=True,
+    ).stdout.split()[2]
+    assert pinned_in_tree == GOLDEN_LIQUID_PINNED
+    sub_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=sub, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert sub_head == pinned_in_tree, "submodule must be at the pinned SHA, not the default branch tip"
+
+    # oracle object from the post-fix commit must not be reachable/present
+    post_fix = subprocess.run(["git", "cat-file", "-e", GOLDEN_LIQUID_POST_FIX_TIP], cwd=sub, capture_output=True)
+    assert post_fix.returncode != 0, "post-fix golden-liquid oracle must not be present in the submodule"
+
+    assert verify_sealed(wd) == []
+
+
+# --- C2/D16: dead --branch fallback dropped; fetch+checkout path is sealed -
+
+def test_fallback_clone_path_produces_sealed_workspace(sample_task, tmp_path: Path):
+    dest = tmp_path / "fb"
+    _clone_at(UPSTREAM, sample_task.base_sha, dest, force_fallback=True)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
+    _provision_submodules(dest)
+
+    log = subprocess.run(
+        ["git", "log", "--all", "--format=%H"], cwd=dest, capture_output=True, text=True
+    ).stdout.split()
+    assert log == [sample_task.base_sha]
+    assert sample_task.fix_sha not in log
+    assert verify_sealed(dest) == []
+
+
+# --- C3: object database checked directly, not just refs -------------------
+
+def test_verify_sealed_flags_dangling_commit_objects(sample_task, tmp_path: Path):
+    """Simulates what the pre-fix fallback path left behind: refs deleted
+    but the abandoned commit's objects still present in the object DB."""
+    dest = tmp_path / "dangling"
+    subprocess.run(["git", "clone", "--depth", "1", "--no-tags", UPSTREAM, str(dest)], check=True, capture_output=True)
+    subprocess.run(["git", "fetch", "--depth", "1", "origin", sample_task.base_sha], cwd=dest, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=dest, check=True, capture_output=True)
+    # unlike _prune_to_single_commit, only delete the ref — leave the object DB dirty
+    refs = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)"], cwd=dest, capture_output=True, text=True, check=True
+    ).stdout.split()
+    for ref in refs:
+        subprocess.run(["git", "update-ref", "-d", ref], cwd=dest, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, capture_output=True)
+
+    log = subprocess.run(["git", "log", "--all", "--format=%H"], cwd=dest, capture_output=True, text=True).stdout.split()
+    assert log == [sample_task.base_sha], "ref-level view looks sealed"
+
+    leaks = verify_sealed(dest)
+    assert leaks, "object database still holds the abandoned commit; verify_sealed must catch it"
+    assert any("object database" in leak for leak in leaks)
+
+
+# --- I1: instruction files removed from HEAD, not just unlinked ------------
+
+def test_strips_instruction_file_from_history_and_leaves_clean_tree(tmp_path: Path):
+    src = tmp_path / "src"
+    _init_local_repo(src)
+    (src / "CLAUDE.md").write_text("the fix is in loop.py")
+    (src / "real.py").write_text("x = 1\n")
+    sha = _seed_commit(src)
+
+    dest = tmp_path / "ws"
+    _clone_at(str(src), sha, dest)
+    _strip_instruction_files(dest)
+
+    assert not (dest / "CLAUDE.md").exists()
+    show = subprocess.run(["git", "show", "HEAD:CLAUDE.md"], cwd=dest, capture_output=True, text=True)
+    assert show.returncode != 0, "instruction file must be gone from HEAD, not just the working tree"
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=dest, capture_output=True, text=True).stdout
+    assert status.strip() == "", "removal must not leave the tree dirty"
+
+
+# --- I2: broader filename list, nested paths, directories ------------------
+
+def test_strips_nested_and_directory_instruction_paths(tmp_path: Path):
+    src = tmp_path / "src2"
+    _init_local_repo(src)
+    (src / "sub").mkdir()
+    (src / "sub" / "CLAUDE.md").write_text("nested")
+    (src / ".claude").mkdir()
+    (src / ".claude" / "settings.json").write_text("{}")
+    (src / ".cursor" / "rules").mkdir(parents=True)
+    (src / ".cursor" / "rules" / "x.mdc").write_text("rule")
+    (src / "GEMINI.md").write_text("g")
+    (src / "real.py").write_text("x = 1\n")
+    sha = _seed_commit(src)
+
+    dest = tmp_path / "ws2"
+    _clone_at(str(src), sha, dest)
+    _strip_instruction_files(dest)
+
+    assert not (dest / "sub" / "CLAUDE.md").exists()
+    assert not (dest / ".claude").exists()
+    assert not (dest / ".cursor" / "rules").exists()
+    assert not (dest / "GEMINI.md").exists()
+    assert (dest / "real.py").exists()
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=dest, capture_output=True, text=True).stdout
+    assert status.strip() == ""
+
+
+# --- I3: fail-loud branches exercised ---------------------------------------
+
+def test_verify_sealed_missing_git_dir_is_a_leak(tmp_path: Path):
+    empty = tmp_path / "not_a_repo"
+    empty.mkdir()
+    leaks = verify_sealed(empty)
+    assert leaks, "unknown state must never be reported as sealed"
+    assert any("no .git" in leak for leak in leaks)
+
+
+def test_verify_sealed_git_failure_is_a_leak(tmp_path: Path):
+    broken = tmp_path / "broken_repo"
+    broken.mkdir()
+    (broken / ".git").write_text("not a real git dir")
+    leaks = verify_sealed(broken)
+    assert leaks, "a broken repo must never be reported as sealed ([] is a pass)"
