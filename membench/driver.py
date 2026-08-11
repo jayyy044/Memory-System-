@@ -29,6 +29,31 @@ _CONTAINER_CONFIG = "/run/membench/config"
 # Linux container anyway).
 _PASSTHROUGH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _REPO_ROOT / ".env"
+
+
+def _dotenv_value(key: str) -> str | None:
+    """Falls back to the repo-root .env when a credential isn't already in
+    os.environ - subagents/pytest runs don't inherit the operator's shell,
+    so the file is the only thing every process can see. Never logs the
+    value. Minimal KEY=VALUE line parser (# comments, blank lines skipped) -
+    no reason to add python-dotenv for one file read."""
+    if not _ENV_FILE.exists():
+        return None
+    for line in _ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return None
+
+
+def _credential(var: str) -> str | None:
+    return os.environ.get(var) or _dotenv_value(var)
+
 # D23: container must start with exactly these capabilities, all of them
 # spent by seal-egress.sh before the agent gets control. NET_ADMIN writes
 # the egress iptables rules; SETUID/SETGID drop root -> uid 1000 (claude
@@ -150,8 +175,9 @@ def _container_env_args() -> list[str]:
         "LC_ALL": "C.UTF-8",
     }
     for var in _PASSTHROUGH_ENV_VARS:
-        if os.environ.get(var):
-            env[var] = os.environ[var]
+        val = _credential(var)
+        if val:
+            env[var] = val
     args = []
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]

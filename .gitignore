@@ -4,3 +4,4 @@ __pycache__/
 fixtures/liquid/
 .venv/
 .superpowers/
+.env
