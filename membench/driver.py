@@ -101,7 +101,25 @@ def _ensure_image() -> str:
     return _IMAGE_TAG
 
 
-def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProcess:
+def _scrub(text, secrets: list[str]):
+    """D38: a credential must never survive into an exception, a traceback,
+    or a CI log. Handles bytes as well as str: TimeoutExpired.output/.stderr
+    are BYTES even when subprocess.run was called with text=True (the
+    partial buffers are never decoded on the timeout path) - verified, this
+    raised TypeError the first time through."""
+    if not text:
+        return text
+    as_bytes = isinstance(text, bytes)
+    marker = b"***REDACTED***" if as_bytes else "***REDACTED***"
+    for s in secrets:
+        if s:
+            text = text.replace(s.encode() if as_bytes else s, marker)
+    return text
+
+
+def _docker_run(
+    args: list[str], *, timeout_s: int, secret_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """I1: `docker run --rm` on a client-side subprocess timeout only kills
     the docker CLI, not the container - it keeps running detached,
     bind-mounted workspace and all, billing. Always pass --name so a
@@ -118,14 +136,23 @@ def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProce
     iteration 0 unconditionally (verified: it "succeeded" whether or not
     anything was actually removed, which is exactly why 4/5 early-timeout
     runs still leaked under that version). Poll actual existence via
-    `docker inspect` instead of trusting `rm`'s exit status."""
+    `docker inspect` instead of trusting `rm`'s exit status.
+
+    D38: `secret_env` values reach the container through THIS process's own
+    environment - docker's `-e NAME` form (no `=`) tells the client to read
+    the value from its own env - never as `-e NAME=VALUE` on argv, which is
+    world-readable in host `ps` and, verified, ends up inside
+    subprocess.TimeoutExpired (`token in repr(e.cmd)` was True) which this
+    function re-raises. The re-raise is scrubbed as well, so a future caller
+    that puts a secret back on argv still cannot leak it through here."""
     name = f"membench-{uuid.uuid4().hex[:12]}"
     cmd = ["docker", "run", "--rm", "--name", name, *args]
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
+            env={**os.environ, **secret_env} if secret_env else None,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         # The daemon can still be finishing the container's own create/start
         # after the client is killed - a container that doesn't exist YET at
         # the first check can still appear a moment later. Loop rm+re-check
@@ -140,7 +167,17 @@ def _docker_run(args: list[str], *, timeout_s: int) -> subprocess.CompletedProce
             ).returncode == 0
             if not still_exists:
                 break
-        raise
+        secrets = list((secret_env or {}).values()) + [
+            v for v in (_credential(k) for k in _PASSTHROUGH_ENV_VARS) if v
+        ]
+        # `from None`: chaining would attach the ORIGINAL, unscrubbed
+        # exception to the traceback and undo the whole point of this.
+        raise subprocess.TimeoutExpired(
+            cmd=[_scrub(a, secrets) for a in cmd],
+            timeout=e.timeout,
+            output=_scrub(e.output, secrets),
+            stderr=_scrub(e.stderr, secrets),
+        ) from None
 
 
 def tools_from_init(raw: str) -> list[str]:
@@ -160,13 +197,27 @@ def tools_from_init(raw: str) -> list[str]:
     return []
 
 
-def _container_env_args() -> list[str]:
-    """`-e KEY=VALUE` args for `docker run`. Never forwards the host's
-    os.environ - only this explicit allowlist reaches the container. HOME
-    and CLAUDE_CONFIG_DIR point at container-local paths (never bind-mounted -
+def _container_env_args(*, credentials: bool) -> tuple[list[str], dict[str, str]]:
+    """`-e` args for `docker run`, plus the secret values to inject via the
+    client's own environment. Never forwards the host's os.environ - only
+    this explicit allowlist reaches the container. HOME and
+    CLAUDE_CONFIG_DIR point at container-local paths (never bind-mounted -
     review round 2: no reason to route them through the host filesystem at
     all when nothing needs to read them back afterward); seal-egress.sh
-    creates and chowns them itself before dropping to uid 1000."""
+    creates and chowns them itself before dropping to uid 1000.
+
+    D37: `credentials` is opt-in per call site, not a property of the
+    image. Only run_agent needs a token; egress_sealed is a pure
+    reachability probe. Passing one to it meant the pre-seal, root, network-
+    open dependency-install stage could read the operator's real credential
+    out of its own environment (reproduced: `token_visible=True
+    token_len=108`). Nothing that runs before the seal is up ever sees one
+    now - the credential-install stage and the probe both run with
+    credentials=False.
+
+    D38: credentials are emitted as bare `-e NAME` (docker reads the value
+    from the client's environment) - never `-e NAME=VALUE`, which puts the
+    token in host `ps` and in every exception carrying the argv."""
     env = {
         "HOME": _CONTAINER_HOME,  # fresh per-run, container-local: no host dotfiles/creds
         "CLAUDE_CONFIG_DIR": _CONTAINER_CONFIG,  # fresh per-run, container-local: no host CLAUDE.md/hooks/plugins/skills/auto-memory
@@ -174,14 +225,17 @@ def _container_env_args() -> list[str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
-    for var in _PASSTHROUGH_ENV_VARS:
-        val = _credential(var)
-        if val:
-            env[var] = val
     args = []
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
-    return args
+    secret_env: dict[str, str] = {}
+    if credentials:
+        for var in _PASSTHROUGH_ENV_VARS:
+            val = _credential(var)
+            if val:
+                args += ["-e", var]  # name only; value travels via secret_env
+                secret_env[var] = val
+    return args, secret_env
 
 
 def _parse_stream(raw: str) -> tuple[str, list[ToolCall], dict]:
@@ -238,11 +292,12 @@ def run_agent(
     `claude` subprocess - stdout is still stream-json, so _parse_stream
     needs no changes."""
     image = _ensure_image()
+    env_args, secret_env = _container_env_args(credentials=True)
     proc = _docker_run(
         [
             *_CAP_ARGS,
             "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
-            *_container_env_args(),
+            *env_args,
             image,
             "claude", "-p", prompt,
             "--output-format", "stream-json",
@@ -259,6 +314,7 @@ def run_agent(
             "--disallowedTools", _DISALLOWED_TOOLS,
         ],
         timeout_s=timeout_s,
+        secret_env=secret_env,
     )
     text, calls, meta = _parse_stream(proc.stdout)
     return Transcript(
@@ -288,7 +344,12 @@ def egress_sealed(workdir: Path) -> dict:
         [
             *_CAP_ARGS,
             "-v", f"{workdir}:{_CONTAINER_WORKDIR}",
-            *_container_env_args(),  # seal-egress.sh unconditionally mkdir/chowns $HOME/$CLAUDE_CONFIG_DIR
+            # D37: credentials=False. This is a reachability probe - it runs
+            # no agent and needs no token, and the dependency-install stage
+            # inside the entrypoint runs as root, pre-seal, with the network
+            # open, so anything in this container's environment is readable
+            # by workspace-derived code at exactly the worst moment.
+            *_container_env_args(credentials=False)[0],  # seal-egress.sh mkdir/chowns $HOME/$CLAUDE_CONFIG_DIR
             image,
             "sh", "-c",
             # `; true` at the end: a blocked github curl exits nonzero, and

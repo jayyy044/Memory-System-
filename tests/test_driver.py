@@ -1,6 +1,25 @@
 from pathlib import Path
 import pytest
-from membench.driver import run_agent, Transcript
+from membench.driver import _PASSTHROUGH_ENV_VARS, _container_env_args, run_agent, Transcript
+
+
+# D37/D38: no docker needed - these are the two credential-handling
+# regressions in pure argument construction, so they run in the default
+# suite rather than only under -m live.
+def test_credential_never_appears_in_argv(monkeypatch):
+    monkeypatch.setenv(_PASSTHROUGH_ENV_VARS[0], "sk-secret-token-value")
+    args, secret_env = _container_env_args(credentials=True)
+    assert "sk-secret-token-value" not in " ".join(args)
+    assert _PASSTHROUGH_ENV_VARS[0] in args  # bare `-e NAME` form
+    assert secret_env[_PASSTHROUGH_ENV_VARS[0]] == "sk-secret-token-value"
+
+
+def test_egress_probe_gets_no_credential(monkeypatch):
+    monkeypatch.setenv(_PASSTHROUGH_ENV_VARS[0], "sk-secret-token-value")
+    args, secret_env = _container_env_args(credentials=False)
+    assert secret_env == {}
+    assert not any(v in args for v in _PASSTHROUGH_ENV_VARS)
+    assert "sk-secret-token-value" not in " ".join(args)
 
 
 @pytest.mark.live

@@ -15,11 +15,19 @@ set -eu
 # never executes anything from the workspace; the names it prints are
 # installed from PyPI by name, never by path. Fails loud - a broken parse or
 # install must not silently proceed.
-deps="$(python3 /usr/local/bin/collect_deps.py /workspace)" \
+# D36: the spec list goes through a file, not a shell variable. The previous
+# `pip3 install $deps` was an UNQUOTED expansion of workspace-derived text -
+# word-splitting and globbing both applied to it. Writing to a root-owned
+# path outside the mount and using `pip -r` means no shell expansion of
+# workspace content happens at all; collect_deps.py has already rejected
+# every entry that is not a plain PEP 508 name/extras/version spec (from
+# BOTH pyproject.toml and requirements.txt - validating only the latter is
+# what left this hole open twice).
+deps_file=/run/membench-deps.txt
+python3 /usr/local/bin/collect_deps.py /workspace > "$deps_file" \
   || { echo "seal-egress: dependency name extraction failed" >&2; exit 1; }
-if [ -n "$deps" ]; then
-  # shellcheck disable=SC2086
-  pip3 install --no-cache-dir --break-system-packages $deps \
+if [ -s "$deps_file" ]; then
+  pip3 install --no-cache-dir --break-system-packages -r "$deps_file" \
     || { echo "seal-egress: dependency install failed" >&2; exit 1; }
 fi
 
