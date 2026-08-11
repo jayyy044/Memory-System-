@@ -12,6 +12,9 @@
 
 - Subject repo is `jg-rp/liquid`, MIT. Tasks come from **post-cutoff issues only** (closed 2026-06 or later) — contamination is avoided by selection, never assumed absent.
 - Every workspace is a **shallow clone (`--depth 1`) at the base commit** with no other refs. History leakage is the primary threat model.
+- **Submodules are part of the workspace and part of the threat model.** `git submodule update --depth 1` fetches the default branch tip, NOT the pinned commit — for `liquid` that tip is the post-fix `golden-liquid` oracle. Submodules must be checked out at the exact pinned SHA, have their remotes removed, and be inspected by `verify_sealed` recursively.
+- **`provision()` must call `verify_sealed()` on its own output and raise on any leak.** A workspace that is only checked by a separate gate is a workspace that ships unchecked when the gate is skipped.
+- **The agent must not be able to reach the network or the host environment.** `run_agent` passes an explicit `env=` (never inheriting), sets `CLAUDE_CONFIG_DIR` to a per-run temp dir and `TZ=UTC`, blanks `GH_TOKEN`/`GITHUB_TOKEN`, and denies `WebFetch`/`WebSearch` plus `gh`/`curl`/`git fetch` at the tool layer. Sealing git history is necessary and NOT sufficient: `gh` is installed and authenticated on the host, and the upstream issue is public.
 - `TZ=UTC` must be set for every pytest invocation — two date-filter tests fail otherwise.
 - `tests/golden-liquid` submodule must be fetched at provisioning time, never during a scored run.
 - **No number is reported until all ten audit checks pass.** A failing gate blocks reporting, not just warns.
@@ -359,6 +362,10 @@ def _git(repo_dir: Path, *args: str) -> str:
 
 def map_issue_to_commit(repo_dir: Path, issue: int) -> str | None:
     """Three mapping paths, most specific first."""
+    # NOTE: `git clone --branch <raw sha>` is NOT a valid fallback — --branch takes a
+    # branch or tag name, never a commit SHA. Reproduced: "fatal: Remote branch <sha>
+    # not found in upstream origin". Any git lacking --revision falls straight to the
+    # fetch+checkout path, which leaves refs/heads/<default> alive and must be pruned.
     # 1. merge commit from a fix-<issue> branch
     for line in _git(repo_dir, "log", "--all", "--merges", "--format=%H|%s").splitlines():
         sha, _, subject = line.partition("|")
