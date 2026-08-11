@@ -371,7 +371,9 @@ def map_issue_to_commit(repo_dir: Path, issue: int) -> str | None:
         if re.search(rf"(fix|close[sd]?|resolve[sd]?)[^0-9]*#{issue}\b", msg, re.I):
             return sha.strip()
     # 3. changelog pickaxe — the commit that added the entry
-    shas = _git(repo_dir, "log", "--all", "--format=%H", f"-S issues/{issue})", "--", "CHANGES.md")
+    # -S and its value MUST be separate argv elements: subprocess does no word
+    # splitting, so f"-S issues/{n})" is parsed as -S with a leading-space value.
+    shas = _git(repo_dir, "log", "--all", "--format=%H", "-S", f"issues/{issue})", "--", "CHANGES.md")
     lines = [s for s in shas.splitlines() if s.strip()]
     return lines[-1] if lines else None
 
