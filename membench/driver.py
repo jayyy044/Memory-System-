@@ -1,8 +1,43 @@
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from membench.models import ToolCall, Transcript
+
+# Denied at the tool layer. Verified live against claude 2.1.227 (see
+# task-1-report.md): WebFetch/WebSearch disappear from the tool list entirely;
+# "Bash(gh *)" / "Bash(curl *)" / "Bash(git fetch*)" block those specific
+# commands (recorded in result.permission_denials) while leaving Bash itself
+# usable for git status/log/diff and pytest. Bash cannot be denied wholesale -
+# the arms must run pytest in the workspace.
+_DISALLOWED_TOOLS = "WebFetch,WebSearch,Bash(gh *),Bash(curl *),Bash(git fetch*)"
+
+# Forwarded from the operator's real environment when present; everything else
+# the child sees comes from the explicit allowlist in _sealed_env. Required:
+# setting CLAUDE_CONFIG_DIR at all (even to its own default path, verified live)
+# disables the CLI's Keychain OAuth lookup, so a sealed run cannot authenticate
+# without one of these.
+_PASSTHROUGH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+def _sealed_env(config_dir: Path, home_dir: Path) -> dict:
+    """Explicit child environment. Never inherit the parent's os.environ."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),  # to find git/python/claude
+        "HOME": str(home_dir),  # fresh per-run dir: no host dotfiles/creds
+        "CLAUDE_CONFIG_DIR": str(config_dir),  # fresh per-run dir: no host CLAUDE.md/hooks/plugins/skills/auto-memory
+        "TZ": "UTC",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+    }
+    for var in _PASSTHROUGH_ENV_VARS:
+        if os.environ.get(var):
+            env[var] = os.environ[var]
+    return env
 
 
 def _parse_stream(raw: str) -> tuple[str, list[ToolCall], dict]:
@@ -54,21 +89,25 @@ def run_agent(
     model: str,
     timeout_s: int = 900,
 ) -> Transcript:
-    proc = subprocess.run(
-        [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--max-turns", str(max_turns),
-            "--model", model,
-            "--permission-mode", "acceptEdits",
-        ],
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        stdin=subprocess.DEVNULL,   # without this every run stalls 3s waiting on stdin
-    )
+    with tempfile.TemporaryDirectory(prefix="membench-cfg-") as config_dir, \
+         tempfile.TemporaryDirectory(prefix="membench-home-") as home_dir:
+        proc = subprocess.run(
+            [
+                "claude", "-p", prompt,
+                "--output-format", "stream-json",
+                "--verbose",
+                "--max-turns", str(max_turns),
+                "--model", model,
+                "--permission-mode", "acceptEdits",
+                "--disallowedTools", _DISALLOWED_TOOLS,
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            stdin=subprocess.DEVNULL,   # without this every run stalls 3s waiting on stdin
+            env=_sealed_env(Path(config_dir), Path(home_dir)),
+        )
     text, calls, meta = _parse_stream(proc.stdout)
     return Transcript(
         text=text,
