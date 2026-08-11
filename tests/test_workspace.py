@@ -320,12 +320,24 @@ def test_provision_derives_url_from_task_repo_unless_overridden(tmp_path, monkey
 
 # --- case sensitivity: does a tracked `Claude.md` survive stripping? -------
 
-def test_case_variant_instruction_filename_is_still_stripped(tmp_path: Path):
-    """macOS's default filesystem is case-insensitive; rglob('CLAUDE.md') is
-    a literal (non-wildcard) pattern, so pathlib resolves it via a direct
-    filesystem probe that inherits that case-insensitivity. Verified: this
-    strips a tracked `Claude.md` on this machine. Kept as a real test, not
-    an inference, since the answer is filesystem-dependent."""
+def test_case_variant_instruction_names_match_regardless_of_filesystem(tmp_path: Path):
+    """M3: matching is done by our own lowercase comparison (_matches_
+    instruction_pattern), not by handing a literal pattern to rglob and
+    trusting the filesystem's collation. Asserted at the matcher level first
+    — that's the platform-independent property, true identically on APFS
+    and ext4 — because a filesystem-level existence check on this dev
+    machine (case-insensitive) would pass whether or not the fix exists,
+    which is exactly the false-assurance shape flagged in fix round 3."""
+    from membench.workspace import _matches_instruction_pattern
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    for variant in ("Claude.md", "CLAUDE.MD", "claude.md", "AGENTS.MD", ".Claude", ".CURSOR/RULES"):
+        assert _matches_instruction_pattern(repo_dir / variant, repo_dir), variant
+    assert not _matches_instruction_pattern(repo_dir / "real.py", repo_dir)
+
+    # end-to-end: the variant is actually removed from HEAD through provision()'s
+    # real pipeline, not just recognized by the matcher in isolation.
     src = tmp_path / "src8"
     _init_local_repo(src)
     (src / "Claude.md").write_text("the fix is in loop.py")

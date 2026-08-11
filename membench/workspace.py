@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +17,13 @@ INSTRUCTION_NAMES = (
 INSTRUCTION_PATHS = (
     ".claude", ".cursor/rules", ".github/copilot-instructions.md", ".github/instructions",
 )
+
+# M3: matched by lowercasing and comparing ourselves rather than relying on
+# rglob + the filesystem's own collation — on a case-sensitive filesystem
+# (ext4, most CI) rglob("CLAUDE.md") never matches a tracked "claude.md";
+# it only worked on the dev machine because APFS is case-insensitive.
+_NAMES_LOWER = {n.lower() for n in INSTRUCTION_NAMES}
+_PATHS_LOWER = tuple(tuple(part.lower() for part in Path(p).parts) for p in INSTRUCTION_PATHS)
 
 
 def _to_https(url: str) -> str:
@@ -145,21 +153,40 @@ def _submodule_paths(repo_dir: Path) -> set[Path]:
     return {(repo_dir / p).resolve() for p, _ in _submodule_entries(repo_dir)}
 
 
+def _matches_instruction_pattern(entry: Path, repo_dir: Path) -> bool:
+    rel_parts = tuple(part.lower() for part in entry.relative_to(repo_dir).parts)
+    if rel_parts[-1] in _NAMES_LOWER:
+        return True
+    return any(rel_parts[-len(pat):] == pat for pat in _PATHS_LOWER if len(pat) <= len(rel_parts))
+
+
 def _find_instruction_hits(repo_dir: Path) -> list[Path]:
     """Every instruction file/dir under repo_dir, at any depth (F2), excluding
     .git internals and anything inside a submodule (submodules are separate
     repos, scanned/stripped by recursing into them, not by crossing into
-    their working tree from here — F1: stripping and checking must agree)."""
+    their working tree from here — F1: stripping and checking must agree).
+    M3: walks the tree and compares lowercased names ourselves instead of
+    handing patterns to rglob, so the result doesn't depend on whether the
+    filesystem collates case-insensitively (APFS) or not (ext4)."""
     sub_dirs = _submodule_paths(repo_dir)
     hits: list[Path] = []
-    for pattern in INSTRUCTION_NAMES + INSTRUCTION_PATHS:
-        for hit in repo_dir.rglob(pattern):
-            if ".git" in hit.parts:
-                continue
-            resolved = hit.resolve()
-            if any(resolved == sd or sd in resolved.parents for sd in sub_dirs):
-                continue
-            hits.append(hit)
+    for root, dirnames, filenames in os.walk(repo_dir):
+        root_path = Path(root)
+        resolved_root = root_path.resolve()
+        if any(resolved_root == sd or sd in resolved_root.parents for sd in sub_dirs):
+            dirnames[:] = []  # separate repo — recursion, not filesystem crossing, handles it
+            continue
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        for name in list(dirnames):
+            entry = root_path / name
+            if _matches_instruction_pattern(entry, repo_dir):
+                hits.append(entry)
+                dirnames.remove(name)  # matched dir is removed wholesale, don't descend into it
+        for name in filenames:
+            entry = root_path / name
+            if _matches_instruction_pattern(entry, repo_dir):
+                hits.append(entry)
     return hits
 
 
