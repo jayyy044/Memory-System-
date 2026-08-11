@@ -39,8 +39,8 @@ def test_test_passed_catches_seeded_passed_behind_raw_call_failure():
     assert _test_passed({"outcome": "passed", "call": {"outcome": "passed"}}) is True
 
 
-def test_run_tests_reports_per_test_results(sample_task: BenchTask, provisioned_workdir: Path):
-    results = run_tests(provisioned_workdir, sample_task, ["tests/test_cycle_tag.py"])
+def test_run_tests_reports_per_test_results(sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path):
+    results = run_tests(provisioned_workdir, sample_task, ["tests/test_cycle_tag.py"], reference_repo=liquid_repo)
     assert results, "expected at least one test result"
     assert all(isinstance(v, bool) for v in results.values())
 
@@ -53,7 +53,9 @@ def _issue_209_task(sample_task: BenchTask) -> BenchTask:
     )
 
 
-def test_run_tests_full_suite_only_failure_is_the_f2p_node(sample_task: BenchTask, provisioned_workdir: Path):
+def test_run_tests_full_suite_only_failure_is_the_f2p_node(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
     # R3: the brief's original canary ("a full run must be green") does not
     # hold post gold-test-restoration - restoring tests/test_issues.py to
     # fix_sha content adds the real test_issue_209, which legitimately fails
@@ -65,7 +67,7 @@ def test_run_tests_full_suite_only_failure_is_the_f2p_node(sample_task: BenchTas
     # test originally existed) is exercised along the way by the date-filter
     # modules, which are part of the full run.
     task = _issue_209_task(sample_task)
-    results = run_tests(provisioned_workdir, task, None)
+    results = run_tests(provisioned_workdir, task, None, reference_repo=liquid_repo)
     non_passing = [k for k, v in results.items() if not v]
     assert non_passing == task.fail_to_pass
 
@@ -99,14 +101,14 @@ def test_run_tests_restores_gold_test_files_defeats_rewritten_test(
         base_content + "\n\ndef test_issue_209() -> None:\n"
         "    assert True  # a cheating agent rewrote the test instead of fixing the source\n"
     )
-    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"])
+    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"], reference_repo=liquid_repo)
     assert results["tests/test_issues.py::test_issue_209"] is False, (
         "the gold test (which exercises the real bug) must have replaced the "
         "agent's rewritten one and failed against the still-unfixed source"
     )
 
 
-def test_planted_conftest_cannot_force_solved(sample_task: BenchTask, provisioned_workdir: Path):
+def test_planted_conftest_cannot_force_solved(sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path):
     # R2/D50: liquid's gold tree has no conftest.py at any level, so nothing
     # in the old (restore-only-what-gold-has) mechanism ever touched an
     # agent-CREATED one. Demonstrated live in review: a root conftest.py
@@ -120,19 +122,24 @@ def test_planted_conftest_cannot_force_solved(sample_task: BenchTask, provisione
         "    if report.when == 'call':\n"
         "        return 'passed', '.', 'PASSED'\n"
     )
-    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"])
+    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"], reference_repo=liquid_repo)
     assert results["tests/test_issues.py::test_issue_209"] is False
     assert not conftest.exists(), "the planted conftest.py must be deleted, not merely outvoted"
 
 
-def test_planted_post_checkout_hook_does_not_execute(sample_task: BenchTask, provisioned_workdir: Path):
-    # S1/D52: CRITICAL - the previous mechanism (`git checkout FETCH_HEAD --
-    # <paths>`, host-side, against an agent-writable repo) fires
-    # post-checkout, executing a planted hook as this HOST process - outside
-    # the container, outside the egress seal, with full network. Verified
-    # independently (see task-4-report.md) that plain `git checkout <ref> --
-    # path` fires the hook and `git cat-file -p` does not; this exercises
-    # the actual run_tests() path end to end.
+def test_planted_post_checkout_hook_does_not_execute(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
+    # S1/D52: the previous mechanism (`git checkout FETCH_HEAD -- <paths>`,
+    # host-side, against an agent-writable repo) fires post-checkout,
+    # executing a planted hook as this HOST process - outside the container,
+    # outside the egress seal, with full network. Verified independently
+    # (see task-4-report.md) that plain `git checkout <ref> -- path` fires
+    # the hook and `git cat-file -p` does not; this exercises the actual
+    # run_tests() path end to end. D57 additionally removed EVERY git
+    # invocation against the workspace (see
+    # test_hostile_git_config_cannot_execute_on_host below) - this test is
+    # kept as a narrower regression for the checkout-specific sub-vector.
     task = _issue_209_task(sample_task)
     hooks_dir = provisioned_workdir / ".git" / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -141,14 +148,59 @@ def test_planted_post_checkout_hook_does_not_execute(sample_task: BenchTask, pro
     hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
     hook.chmod(0o755)
     try:
-        run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"])
+        run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"], reference_repo=liquid_repo)
         assert not marker.exists(), "post-checkout hook must never execute during host-side restoration"
     finally:
         hook.unlink()
         marker.unlink(missing_ok=True)
 
 
-def test_modified_test_init_cannot_force_solved(sample_task: BenchTask, provisioned_workdir: Path):
+def test_hostile_git_config_cannot_execute_on_host(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
+    # S1/D57: CRITICAL, the actual root cause - round 3's fix (git cat-file
+    # instead of git checkout) closed the post-checkout hook sub-vector but
+    # still ran `git remote add`/`fetch` with cwd=workdir, i.e. still invoked
+    # git against the agent-writable repo at all. A `protocol.ext.allow` +
+    # `url.<ext-command>.insteadOf=<clone url>` pair in .git/config (never
+    # reset - os.walk skips .git, nothing rewrites config) makes ANY git
+    # command that touches a remote matching that URL execute an arbitrary
+    # command as this host process, regardless of `core.hooksPath` (not a
+    # hooks mechanism - it's git's own remote-helper dispatch). Verified
+    # independently against a throwaway repo before fixing: the `git fetch`
+    # attempt still fails ("Could not read from remote repository") but the
+    # planted command runs anyway, before git gets to fail.
+    #
+    # The categorical fix (see _reset_test_surface's docstring): NO git
+    # command is ever invoked with cwd anywhere under the workspace, for any
+    # purpose. Gold content comes exclusively from `reference_repo`. This
+    # test's marker must never appear regardless of what the hostile config
+    # claims to rewrite, because nothing here ever reads it in the first
+    # place - scoring must also complete normally, proving this isn't
+    # "safe" merely because everything now errors out.
+    task = _issue_209_task(sample_task)
+    marker = provisioned_workdir / ".hostile-marker"
+    git_config = provisioned_workdir / ".git" / "config"
+    original = git_config.read_text()
+    hostile = (
+        "\n[protocol \"ext\"]\n"
+        "\tallow = always\n"
+        f"[url \"ext::/bin/sh -c touch$IFS{marker}\"]\n"
+        f"\tinsteadOf = https://github.com/{sample_task.repo}.git\n"
+    )
+    git_config.write_text(original + hostile)
+    try:
+        results = run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"], reference_repo=liquid_repo)
+        assert not marker.exists(), "no git command may ever be invoked against the workspace's own .git/config"
+        assert results, "scoring must complete normally, not merely fail safe"
+    finally:
+        git_config.write_text(original)
+        marker.unlink(missing_ok=True)
+
+
+def test_modified_test_init_cannot_force_solved(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
     # S2/D53: name-based matching missed tests/__init__.py entirely (present
     # in gold - liquid ships an empty one - so the old restore-only-what-
     # exists pass never touched it, and it doesn't look like a test file by
@@ -164,12 +216,14 @@ def test_modified_test_init_cannot_force_solved(sample_task: BenchTask, provisio
         "import _pytest.python\n"
         "_pytest.python.Function.runtest = lambda self: None\n"
     )
-    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"])
+    results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"], reference_repo=liquid_repo)
     assert results["tests/test_issues.py::test_issue_209"] is False
     assert init_file.read_text() == "", "must be restored to gold's (empty) content, not merely outvoted"
 
 
-def test_frozen_deps_ignore_tampered_requirements_txt(sample_task: BenchTask, provisioned_workdir: Path):
+def test_frozen_deps_ignore_tampered_requirements_txt(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
     # S3/D54: liquid's base_sha has no requirements.txt at all, so the
     # frozen dependency set (extracted from base_sha, not live /workspace)
     # must not include this poisoned one. If scoring re-derived from the
@@ -181,7 +235,7 @@ def test_frozen_deps_ignore_tampered_requirements_txt(sample_task: BenchTask, pr
     poison = provisioned_workdir / "requirements.txt"
     poison.write_text("totally-nonexistent-package-membench-probe-xyz==99.0.0\n")
     try:
-        results = run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"])
+        results = run_tests(provisioned_workdir, task, ["tests/test_cycle_tag.py"], reference_repo=liquid_repo)
     finally:
         poison.unlink()
     assert results, "scoring must use the base_sha-frozen dependency set, not the agent's tampered requirements.txt"
@@ -245,7 +299,7 @@ def test_run_tests_raises_on_uncollectible_node_id(synthetic_repo, tmp_path: Pat
     )
     wd = _synthetic_workdir(repo, base_sha, tmp_path / "ws")
     with pytest.raises(RunTestsError):
-        run_tests(wd, task, ["tests/test_broken.py::test_never_collected"], url=str(repo))
+        run_tests(wd, task, ["tests/test_broken.py::test_never_collected"], reference_repo=repo)
 
 
 def test_run_tests_full_suite_continues_past_collection_errors(synthetic_repo, tmp_path: Path):
@@ -262,7 +316,7 @@ def test_run_tests_full_suite_continues_past_collection_errors(synthetic_repo, t
         base_sha=base_sha, fix_sha=fix_sha, changed_files=[],
     )
     wd = _synthetic_workdir(repo, base_sha, tmp_path / "ws")
-    results = run_tests(wd, task, None, url=str(repo))
+    results = run_tests(wd, task, None, reference_repo=repo)
     assert results.get("tests/test_good.py::test_good") is True, (
         "one broken gold test file must not blank the whole run"
     )

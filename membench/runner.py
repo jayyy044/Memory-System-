@@ -132,32 +132,42 @@ def _looks_like_config_name(path: str) -> bool:
     return Path(path).name in _DISCARD_NAMES
 
 
-def _cat_file(workdir: Path, ref: str, path: str) -> bytes | None:
-    """S1: a pure object-database read - no hooks, no smudge/clean filters
-    (those only apply during working-tree materialization, i.e. checkout/
-    merge/add, never a blob read). Returns None if `path` doesn't exist at
-    `ref` (mirrors collect_deps.py's own `if path.exists()` pattern)."""
-    r = subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-p", f"{ref}:{path}"],
-        cwd=workdir, capture_output=True,
-    )
+def _cat_file(repo_dir: Path, ref: str, path: str) -> bytes | None:
+    """A pure object-database read - no hooks, no smudge/clean filters (those
+    only apply during working-tree materialization, i.e. checkout/merge/add,
+    never a blob read). Returns None if `path` doesn't exist at `ref`
+    (mirrors collect_deps.py's own `if path.exists()` pattern).
+
+    S1/D52/D57: `repo_dir` must NEVER be the agent-writable workspace -
+    see `_reset_test_surface`'s docstring for why."""
+    r = subprocess.run(["git", "cat-file", "-p", f"{ref}:{path}"], cwd=repo_dir, capture_output=True)
     return r.stdout if r.returncode == 0 else None
 
 
-def _frozen_deps_file(workdir: Path, task: BenchTask, scratch: Path) -> Path:
+def _require_ref(repo_dir: Path, sha: str) -> None:
+    r = subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo_dir, capture_output=True)
+    if r.returncode != 0:
+        raise RunTestsError(
+            f"reference repo {repo_dir} does not contain commit {sha!r} - refusing to fall back to "
+            f"any operation against the workspace's own (agent-writable, untrusted) git state"
+        )
+
+
+def _frozen_deps_file(task: BenchTask, reference_repo: Path, scratch: Path) -> Path:
     """S3/D54: dependency install at SCORING time must not be re-derived from
     the agent's (possibly tampered) live workspace - demonstrated: a
     workspace requirements.txt of `pytest-timeout==2.3.1` registered a
     plugin inside the scoring run, and `pytest==7.4.4` DOWNGRADED the
-    scorer's own pinned pytest. Freezes the dependency set from
-    task.base_sha instead - what was actually on disk when the agent's
-    episode started, extracted via the same hook-free `_cat_file` blob read
-    (no fetch needed, base_sha's commit is already in this repo's local
-    object database) - and runs collect_deps.py's SAME validated-PEP-508
-    parser against that frozen snapshot rather than /workspace. Safe to run
-    on the host (not root, no pip, tomllib+regex only, same as always)."""
+    scorer's own pinned pytest. Freezes the dependency set from task.base_sha
+    instead - what was actually on disk when the agent's episode started -
+    read from `reference_repo` (D57: a trusted, agent-UNwritable clone, e.g.
+    the full-history fixture; never the workspace itself, see
+    `_reset_test_surface`) and runs collect_deps.py's SAME validated-PEP-508
+    parser against that frozen snapshot. Safe to run on the host (not root,
+    no pip, tomllib+regex only, same as always)."""
+    _require_ref(reference_repo, task.base_sha)
     for name in ("pyproject.toml", "requirements.txt"):
-        blob = _cat_file(workdir, task.base_sha, name)
+        blob = _cat_file(reference_repo, task.base_sha, name)
         if blob is not None:
             (scratch / name).write_bytes(blob)
     proc = subprocess.run(
@@ -171,7 +181,7 @@ def _frozen_deps_file(workdir: Path, task: BenchTask, scratch: Path) -> Path:
     return deps_file
 
 
-def _reset_test_surface(workdir: Path, task: BenchTask, *, url: str | None = None) -> None:
+def _reset_test_surface(workdir: Path, task: BenchTask, reference_repo: Path) -> None:
     """D45(a) + R2/S2: an agent's edits to SOURCE carry into scoring; its
     edits to anything pytest itself loads (tests, conftest.py, pytest config
     files, sitecustomize.py) do not.
@@ -187,56 +197,49 @@ def _reset_test_surface(workdir: Path, task: BenchTask, *, url: str | None = Non
     the file still present. Any module a gold test imports is test surface,
     named like a test or not.
 
-    S1/D52: CRITICAL, fixed this round - the previous version used
-    `git checkout FETCH_HEAD -- <paths>` here, on the HOST, against an
-    agent-writable repository. Pathspec checkouts fire `post-checkout`, so a
-    planted `.git/hooks/post-checkout` executed as this host process (uid
-    501) - outside the container, outside the egress seal, with full
-    network - on every scoring run; demonstrated overwriting the
-    just-restored gold test right back to `assert True`. Every git
-    invocation below passes `-c core.hooksPath=/dev/null` (defence in
-    depth - a repo-local `core.hooksPath` override in the agent's own
-    `.git/config` must not re-enable this), but the actual fix is that
-    nothing here EVER checks out a working tree from an untrusted ref
-    anymore: gold content is extracted blob-by-blob via `git cat-file -p`
-    (no hooks, no smudge/clean filters - see `_cat_file`) and written with
-    plain `Path.write_bytes`, never through git's checkout machinery.
+    S1/D52 + D57: CRITICAL, twice. Round 3 replaced `git checkout` (fires
+    `post-checkout`) with `git cat-file` - that closed the checkout-specific
+    hook sub-vector but ran `git remote add`/`fetch` against the workspace's
+    OWN `.git/config`, which is agent-writable and never reset. A
+    `protocol.ext.allow=always` + `url.<ext-command>.insteadOf=<clone url>`
+    pair in that config makes ANY git command that touches a remote matching
+    that URL execute an arbitrary command as this host process (uid 501),
+    outside the container, outside the seal, with full network - reproduced
+    independently: the `git fetch` attempt still fails ("Could not read from
+    remote repository") but the planted command runs regardless, before git
+    ever gets to fail. `-c core.hooksPath=/dev/null` does nothing against
+    this - it's not a hooks mechanism, it's git's own remote-helper dispatch.
 
-    Runs on the HOST and BEFORE the container starts. Fetching task.fix_sha
-    here is not a seal violation: the agent's run has already ended by the
-    time scoring runs, so there is no further turn for a leaked "future" to
-    reach.
+    The categorical fix: this function invokes NO git command with `cwd`
+    anywhere under `workdir`, for any purpose, ever. Gold content comes
+    exclusively from `reference_repo` - a trusted, agent-UNwritable clone
+    with `task.fix_sha` already in its local history (the full-history
+    fixture in tests; whatever equivalent reference clone corpus
+    construction maintains in production). No fetch, no remote, nothing that
+    reads workspace config. `_require_ref` (called by the caller, `run_tests`,
+    before this runs) fails loudly if `reference_repo` doesn't actually have
+    `fix_sha` rather than falling back to touching the workspace.
+
+    `workdir` here is used ONLY as a destination for `Path.write_bytes`/
+    `os.walk`/`Path.unlink` - plain filesystem operations, never git.
     """
-    remote = "membench-gold"
-    clone_url = url or f"https://github.com/{task.repo}.git"  # url= override for tests only, mirrors workspace.provision's own shape
-    git_safe = ["-c", "core.hooksPath=/dev/null"]  # S1 defence in depth (primary fix: no checkout below at all)
-    subprocess.run(
-        ["git", *git_safe, "remote", "add", remote, clone_url],
-        cwd=workdir, check=True, capture_output=True,
-    )
-    try:
-        subprocess.run(
-            ["git", *git_safe, "fetch", "-q", "--depth", "1", remote, task.fix_sha],
-            cwd=workdir, check=True, capture_output=True,
-        )
-        gold_paths_all = subprocess.run(
-            ["git", *git_safe, "ls-tree", "-r", "--name-only", "FETCH_HEAD"],
-            cwd=workdir, capture_output=True, text=True, check=True,
-        ).stdout.splitlines()
-        test_roots = {p.split("/", 1)[0] for p in gold_paths_all if _is_test_named(p)}
-        gold_surface = {
-            p for p in gold_paths_all
-            if p.split("/", 1)[0] in test_roots or _looks_like_config_name(p)
-        }
-        for rel in sorted(gold_surface):
-            blob = _cat_file(workdir, "FETCH_HEAD", rel)
-            if blob is None:
-                continue  # shouldn't happen - rel came from this same tree - but never crash restoration over one path
-            dest = workdir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(blob)
-    finally:
-        subprocess.run(["git", *git_safe, "remote", "remove", remote], cwd=workdir, check=False, capture_output=True)
+    _require_ref(reference_repo, task.fix_sha)
+    gold_paths_all = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", task.fix_sha],
+        cwd=reference_repo, capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    test_roots = {p.split("/", 1)[0] for p in gold_paths_all if _is_test_named(p)}
+    gold_surface = {
+        p for p in gold_paths_all
+        if p.split("/", 1)[0] in test_roots or _looks_like_config_name(p)
+    }
+    for rel in sorted(gold_surface):
+        blob = _cat_file(reference_repo, task.fix_sha, rel)
+        if blob is None:
+            continue  # shouldn't happen - rel came from this same tree - but never crash restoration over one path
+        dest = workdir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob)
 
     # `gold_surface` (superproject `git ls-tree -r`) never descends into a
     # submodule's own working tree - git treats a submodule as a single
@@ -262,7 +265,7 @@ def _reset_test_surface(workdir: Path, task: BenchTask, *, url: str | None = Non
 
 
 def run_tests(
-    workdir: Path, task: BenchTask, node_ids: list[str] | None = None, *, url: str | None = None
+    workdir: Path, task: BenchTask, node_ids: list[str] | None = None, *, reference_repo: Path
 ) -> dict[str, bool]:
     """Runs pytest for `workdir` inside the sealed container and returns
     {nodeid: passed}. `task` is mandatory, not optional (D45(a)): making
@@ -274,8 +277,17 @@ def run_tests(
     only exact node ids (containing "::") are checked for collectibility
     (D31) - a file target legitimately yields zero results if the whole
     file is skipped/filtered, which isn't the failure this guards against.
+
+    `reference_repo` is mandatory too, and deliberately has no default
+    (D57): a trusted, agent-UNwritable local clone with full history -
+    everything gold content is read from. It replaces the old `url=`
+    override, which pointed `git remote add`/`fetch` AT the workspace; that
+    entire class of operation is gone now, not just its URL source (S1/D57 -
+    see _reset_test_surface's docstring). No implicit fallback to cloning
+    from `task.repo` into the workspace exists - a caller with no reference
+    clone available must be given one, not left to synthesize one insecurely.
     """
-    _reset_test_surface(workdir, task, url=url)
+    _reset_test_surface(workdir, task, reference_repo)
 
     image = _ensure_image()
     report_name = f".membench-report-{uuid.uuid4().hex[:8]}.json"
@@ -309,7 +321,7 @@ def run_tests(
     # env var - the entrypoint installs THIS instead of re-deriving from the
     # agent's live (possibly tampered) /workspace when the var is set.
     with tempfile.TemporaryDirectory(prefix="membench-deps-") as deps_scratch:
-        deps_file = _frozen_deps_file(workdir, task, Path(deps_scratch))
+        deps_file = _frozen_deps_file(task, reference_repo, Path(deps_scratch))
         proc = _docker_run(
             [
                 *_CAP_ARGS,
