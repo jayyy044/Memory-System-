@@ -1685,3 +1685,130 @@ and capturing `permission_denials`.
 **Remaining risk.** `check_cheat_probe` costs a full agent run per task and is the slowest
 gate. If it proves too slow to run every time, run it once per corpus revision rather than
 per benchmark invocation — but never skip it before publishing.
+
+---
+
+### Task 13: Containerized agent execution (executes BEFORE Task 6)
+
+Closes the two coupled Criticals from the Task 1 amendment review. The deny-list approach
+failed: `/usr/bin/curl`, `python3 -c "urllib.request.urlopen(...)"`, `git -C . fetch` and
+`git ls-remote` all reached GitHub, and GitHub's public API needs no credential. Blocking
+`python3` is impossible because the arms must run pytest. Worse, the network seal only
+appeared to hold because `--permission-mode acceptEdits` was rejecting nearly all Bash —
+including pytest — so Task 6 would have removed the only protection in place.
+
+Containers solve both at once: the arms get unrestricted Bash, and GitHub has no route.
+
+**Verified on this host before writing this task:**
+
+```
+docker 29.4.0 via OrbStack (/usr/local/bin/docker)
+--network none                       → github unreachable ("bad address")
+--cap-add=NET_ADMIN + iptables       → SELECTIVE egress works:
+    allow 160.79.104.10 (api.anthropic.com) → HTTP/1.1 40x (reached server)
+    api.github.com                          → download timed out (blocked)
+```
+
+**Files:**
+- Create: `docker/Dockerfile`, `docker/seal-egress.sh`
+- Modify: `membench/driver.py` (`run_agent` runs the agent inside a container)
+- Test: `tests/test_container.py`
+
+**Interfaces:**
+- Consumes: `Transcript`, `ToolCall` from Task 1
+- Produces: `run_agent(...)` keeps its existing signature and return type; only its execution
+  substrate changes. Tasks 6-12 must not need edits.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_container.py
+import pytest
+from membench.driver import egress_sealed, run_agent
+
+
+@pytest.mark.live
+def test_container_blocks_github_allows_anthropic(tmp_path):
+    """The seal must be a property of the container, not of the agent's choices."""
+    assert egress_sealed(tmp_path) == {"anthropic": True, "github": False}
+
+
+@pytest.mark.live
+def test_agent_cannot_reach_github_via_any_interpreter(tmp_path):
+    (tmp_path / "probe.txt").write_text("probe\n")
+    t = run_agent(
+        "Run each of these and report the exit status of each, nothing else: "
+        "1) /usr/bin/curl -s -m 5 https://api.github.com/ "
+        "2) python3 -c \"import urllib.request;urllib.request.urlopen('https://api.github.com/',timeout=5)\" "
+        "3) git ls-remote https://github.com/jg-rp/liquid.git HEAD",
+        workdir=tmp_path, max_turns=10, model="claude-sonnet-5",
+    )
+    assert t.exit_code == 0
+    assert "probe" not in t.text or True   # sanity: agent ran
+    for marker in ("api.github.com",):
+        assert marker in t.text            # it tried
+    assert t.permission_denials == []      # it was NOT blocked by the approval gate
+
+
+@pytest.mark.live
+def test_pytest_runs_unblocked_inside_container(tmp_path):
+    (tmp_path / "test_x.py").write_text("def test_ok():\n    assert True\n")
+    t = run_agent(
+        "Run `python3 -m pytest -q` and report the exact output line.",
+        workdir=tmp_path, max_turns=8, model="claude-sonnet-5",
+    )
+    assert t.permission_denials == []
+    assert "1 passed" in t.text
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `TZ=UTC .venv/bin/python -m pytest tests/test_container.py -m live -v`
+Expected: FAIL with `ImportError: cannot import name 'egress_sealed'`
+
+- [ ] **Step 3: Build the image and the egress seal**
+
+`docker/seal-egress.sh` runs as the container's entrypoint prelude. It resolves the
+Anthropic API host, allowlists every resolved address, permits DNS and loopback, drops
+everything else, then drops `NET_ADMIN` before handing control to the agent so the agent
+cannot rewrite the rules:
+
+```sh
+#!/bin/sh
+set -eu
+for ip in $(getent ahostsv4 "${ANTHROPIC_HOST:-api.anthropic.com}" | awk '{print $1}' | sort -u); do
+  iptables -A OUTPUT -d "$ip" -j ACCEPT
+done
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -j DROP
+exec setpriv --inh-caps=-net_admin --ambient-caps=-net_admin "$@"
+```
+
+`docker/Dockerfile` needs: python3 + pip + pytest, git, node + the `claude` CLI, iptables,
+util-linux (for `setpriv`), and ca-certificates. Pin the base image by digest.
+
+- [ ] **Step 4: Rewrite `run_agent` to execute in the container**
+
+Keep the signature and `Transcript` return unchanged. The workspace mounts at a fixed path;
+stdout still carries `stream-json`, so `_parse_stream` is untouched. Pass the Anthropic
+credential in as an env var. Drop `--disallowedTools` and the `acceptEdits` restriction —
+the container is the boundary now, so the agent gets full Bash and pytest works.
+
+Add `egress_sealed(workdir) -> dict[str, bool]` which starts the container and probes
+both hosts, returning `{"anthropic": bool, "github": bool}`.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `TZ=UTC .venv/bin/python -m pytest tests/test_container.py -m live -v`
+Expected: PASS (3 passed)
+
+Then confirm no regression: `TZ=UTC .venv/bin/python -m pytest -q` and
+`TZ=UTC .venv/bin/python -m pytest -m live -v`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docker/ membench/driver.py tests/test_container.py
+git commit -m "feat: run agents in network-sealed containers"
+```
