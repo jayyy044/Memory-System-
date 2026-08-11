@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 import pytest
-from membench.corpus.extract import map_issue_to_commit, changed_files
+from membench.corpus.extract import map_issue_to_commit, changed_files, AmbiguousMapping
 
 LIQUID = Path("fixtures/liquid")
 
@@ -33,3 +33,22 @@ def test_maps_changelog_pickaxe_issue(repo: Path):
 
 def test_unmappable_issue_returns_none(repo: Path):
     assert map_issue_to_commit(repo, 999999) is None
+
+
+def _commit(path: Path, filename: str, content: str, message: str) -> None:
+    (path / filename).write_text(content)
+    subprocess.run(["git", "-C", str(path), "add", filename], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", message], check=True)
+
+
+def test_ambiguous_mapping_raises(tmp_path: Path):
+    """Two commits both claim to close the same issue (fix + later regression
+    fix) — the function must surface this rather than silently pick the
+    newest one."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    _commit(tmp_path, "a.txt", "1", "fixes #7 first attempt")
+    _commit(tmp_path, "a.txt", "2", "fixes #7 for real this time")
+    with pytest.raises(AmbiguousMapping):
+        map_issue_to_commit(tmp_path, 7)

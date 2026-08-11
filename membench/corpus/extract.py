@@ -24,20 +24,51 @@ def _git(repo_dir: Path, *args: str) -> str:
     ).stdout
 
 
+class AmbiguousMapping(Exception):
+    """Raised when a mapping path finds more than one candidate commit for an
+    issue, instead of silently picking one (e.g. the newest)."""
+
+    def __init__(self, issue: int, shas: list[str]):
+        self.issue = issue
+        self.shas = shas
+        super().__init__(f"issue #{issue}: {len(shas)} candidate commits, ambiguous")
+
+
+def _one_or_raise(issue: int, shas: list[str]) -> str | None:
+    shas = list(dict.fromkeys(shas))  # dedupe, keep order
+    if not shas:
+        return None
+    if len(shas) > 1:
+        raise AmbiguousMapping(issue, shas)
+    return shas[0]
+
+
 def map_issue_to_commit(repo_dir: Path, issue: int) -> str | None:
-    """Three mapping paths, most specific first."""
+    """Three mapping paths, most specific first. Raises AmbiguousMapping if a
+    path finds more than one candidate rather than guessing which is right."""
     # 1. merge commit from a fix-<issue> branch
+    matches = []
     for line in _git(repo_dir, "log", "--all", "--merges", "--format=%H|%s").splitlines():
         sha, _, subject = line.partition("|")
         if re.search(rf"\bfix-{issue}\b", subject):
-            return sha
+            matches.append(sha)
+    result = _one_or_raise(issue, matches)
+    if result:
+        return result
     # 2. commit body closing the issue
+    matches = []
     log = _git(repo_dir, "log", "--all", "--format=%H%x00%s %b%x01")
     for entry in log.split("\x01"):
         sha, _, msg = entry.partition("\x00")
         if re.search(rf"(fix|close[sd]?|resolve[sd]?)[^0-9]*#{issue}\b", msg, re.I):
-            return sha.strip()
-    # 3. changelog pickaxe — the commit that added the entry
+            matches.append(sha.strip())
+    result = _one_or_raise(issue, matches)
+    if result:
+        return result
+    # 3. changelog pickaxe — the commit that added the entry. Multiple hits
+    # here mean the file was touched more than once while the string was
+    # present (e.g. reformatting); take the oldest, which introduced it.
+    # Not the same "guess" as paths 1/2 — the search itself defines "added".
     shas = _git(repo_dir, "log", "--all", "--format=%H", "-S", f"issues/{issue})", "--", "CHANGES.md")
     lines = [s for s in shas.splitlines() if s.strip()]
     return lines[-1] if lines else None
