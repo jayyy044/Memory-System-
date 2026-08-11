@@ -33,6 +33,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY seal-egress.sh /usr/local/bin/seal-egress.sh
 COPY collect_deps.py /usr/local/bin/collect_deps.py
+# R2/D50: a trusted, agent-unreachable ini file (lives in the image, never
+# the bind-mounted /workspace) passed to pytest via `-c` at scoring time so
+# a workspace pyproject.toml's [tool.pytest.ini_options]/addopts, or a
+# planted pytest.ini/tox.ini/setup.cfg, is never consulted for settings -
+# `-c FILE` replaces pytest's config-file auto-discovery outright rather
+# than merging with it.
+COPY membench-pytest.ini /usr/local/etc/membench-pytest.ini
 RUN chmod +x /usr/local/bin/seal-egress.sh
 
 WORKDIR /workspace
