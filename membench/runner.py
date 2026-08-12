@@ -9,7 +9,6 @@ from pathlib import Path
 
 from membench.corpus.extract import BenchTask
 from membench.driver import _CAP_ARGS, _CONTAINER_WORKDIR, _docker_run, _ensure_image
-from membench.workspace import _submodule_paths
 
 # S3/D54: docker/collect_deps.py, reused (not reimplemented) - same
 # validated-PEP-508 parser, run on the HOST against a frozen base_sha
@@ -181,6 +180,41 @@ def _frozen_deps_file(task: BenchTask, reference_repo: Path, scratch: Path) -> P
     return deps_file
 
 
+def _contained_path(workdir: Path, rel: str, *, allow_leaf_symlink: bool = False) -> Path:
+    """S6: `workdir / rel`, refusing to hand back anything that can escape
+    `workdir` through a symlink. Checked one component at a time, because the
+    escaping component is typically a PARENT DIRECTORY, not the destination
+    file - an agent that replaces the gold test root with
+    `<workdir>/tests -> /somewhere/else` makes both `Path.mkdir(parents=True,
+    exist_ok=True)` and `Path.write_bytes` (neither of which stops at a
+    symlink) create and overwrite files on the HOST, outside the container and
+    outside the seal, as this uid. Demonstrated: gold's EMPTY
+    `tests/__init__.py` truncating an attacker-chosen host file to zero bytes.
+    A `dest.is_symlink()` check alone never sees that.
+
+    Fails closed and LOUD: a workspace containing such a link is cheating and
+    the run is void, so this raises rather than skipping the path quietly.
+    Because no component under `workdir` is a symlink, containment holds
+    without ever calling `resolve()` on an agent-controlled path and then
+    trusting the result. Callers must invoke this immediately before the
+    mkdir/write/unlink it guards (there is no concurrent agent during scoring -
+    the container isn't running - so no TOCTOU window in practice).
+
+    `allow_leaf_symlink` is for the delete pass only: `Path.unlink` removes the
+    LINK, never its target, so a planted symlink is safe (and desirable) to
+    delete. Its parent components still must not escape."""
+    parts = rel.split("/")
+    path = workdir
+    for i, part in enumerate(parts):
+        path = path / part
+        if path.is_symlink() and not (allow_leaf_symlink and i == len(parts) - 1):
+            raise RunTestsError(
+                f"workspace path {rel!r} traverses a symlink at {path.relative_to(workdir).as_posix()!r} - "
+                f"refusing to read/write/delete through it; the run is void"
+            )
+    return path
+
+
 def _reset_test_surface(workdir: Path, task: BenchTask, reference_repo: Path) -> None:
     """D45(a) + R2/S2: an agent's edits to SOURCE carry into scoring; its
     edits to anything pytest itself loads (tests, conftest.py, pytest config
@@ -220,48 +254,83 @@ def _reset_test_surface(workdir: Path, task: BenchTask, reference_repo: Path) ->
     before this runs) fails loudly if `reference_repo` doesn't actually have
     `fix_sha` rather than falling back to touching the workspace.
 
+    S6: that rule covers gold CONTENT, and round 4 left an asymmetry behind -
+    the delete pass's submodule EXCLUSION LIST was still derived from the
+    workspace, via `git config -f <workdir>/.gitmodules`. Writing
+    `[submodule "z"] path = .` into that agent-writable file made the
+    workspace ROOT read as a submodule, so os.walk pruned at the first
+    directory and the delete pass visited nothing; a planted root conftest.py
+    then survived into scoring and forced solved=True. Submodule boundaries
+    now come from the same trusted place gold content does: the gitlink
+    (type=commit) entries in `reference_repo`'s tree at `fix_sha`. That is
+    categorical rather than a special case for `path = .` - a gitlink is a
+    tree ENTRY, so it can never denote the tree root, and nothing here parses
+    workspace-supplied config at all. No workspace file is read by any git
+    command, and no git command runs with `cwd` under `workdir`.
+
     `workdir` here is used ONLY as a destination for `Path.write_bytes`/
-    `os.walk`/`Path.unlink` - plain filesystem operations, never git.
+    `os.walk`/`Path.unlink` - plain filesystem operations, never git - and
+    every one of those paths goes through `_contained_path` first (S6, symlink
+    escape).
     """
     _require_ref(reference_repo, task.fix_sha)
-    gold_paths_all = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", task.fix_sha],
+    entries = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", task.fix_sha],
         cwd=reference_repo, capture_output=True, text=True, check=True,
-    ).stdout.splitlines()
+    ).stdout.split("\0")
+    gold_paths_all: list[str] = []
+    # `git ls-tree -r` never descends into a submodule's own working tree -
+    # git treats a submodule as a single type=commit entry, not expanded into
+    # its files. os.walk knows nothing about that boundary, so without this
+    # exclusion the delete pass would wipe legitimate content of a submodule
+    # that happens to live under a test-root name - same submodule-boundary
+    # precedent as workspace.py's own instruction-file walk. (Trusted source
+    # now: these come from the gold tree, not from workspace .gitmodules.)
+    sub_dirs: set[str] = set()
+    for entry in entries:
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        if meta.split()[1] == "commit":
+            sub_dirs.add(path)
+        else:
+            gold_paths_all.append(path)
     test_roots = {p.split("/", 1)[0] for p in gold_paths_all if _is_test_named(p)}
-    gold_surface = {
-        p for p in gold_paths_all
-        if p.split("/", 1)[0] in test_roots or _looks_like_config_name(p)
-    }
+
+    def in_surface(rel: str) -> bool:
+        return rel.split("/", 1)[0] in test_roots or _looks_like_config_name(rel)
+
+    gold_surface = {p for p in gold_paths_all if in_surface(p)}
     for rel in sorted(gold_surface):
         blob = _cat_file(reference_repo, task.fix_sha, rel)
         if blob is None:
             continue  # shouldn't happen - rel came from this same tree - but never crash restoration over one path
-        dest = workdir / rel
+        dest = _contained_path(workdir, rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(blob)
 
-    # `gold_surface` (superproject `git ls-tree -r`) never descends into a
-    # submodule's own working tree - git treats a submodule as a single
-    # "commit" entry, not expanded into its files. os.walk knows nothing
-    # about that boundary, so without this exclusion the delete pass could
-    # wipe legitimate content a submodule happens to share a test-root name
-    # with - same submodule-boundary precedent as workspace.py's own
-    # instruction-file walk.
-    sub_dirs = _submodule_paths(workdir)
-    for root, dirnames, filenames in os.walk(workdir):
-        root_path = Path(root)
-        if any(root_path.resolve() == sd or sd in root_path.resolve().parents for sd in sub_dirs):
+    for root, dirnames, filenames in os.walk(workdir):  # followlinks=False: never descends a symlinked dir
+        rel_root = Path(root).relative_to(workdir).as_posix()
+        if rel_root in sub_dirs:
             dirnames[:] = []
             continue
         if ".git" in dirnames:
             dirnames.remove(".git")
+        prefix = "" if rel_root == "." else f"{rel_root}/"
+        # A symlinked DIRECTORY inside the test surface is agent-planted by
+        # construction (gold restoration would already have raised for a gold
+        # path traversing it). os.walk won't descend it, so its contents can't
+        # be deleted - remove the link itself instead, so pytest can't collect
+        # through it either.
+        for name in list(dirnames):
+            rel = prefix + name
+            if rel not in sub_dirs and in_surface(rel) and (Path(root) / name).is_symlink():
+                _contained_path(workdir, rel, allow_leaf_symlink=True).unlink()
+                dirnames.remove(name)
         for name in filenames:
-            full = root_path / name
-            rel = full.relative_to(workdir).as_posix()
-            in_surface = rel.split("/", 1)[0] in test_roots or _looks_like_config_name(rel)
-            if in_surface and rel not in gold_surface:
-                full.unlink()
+            rel = prefix + name
+            if in_surface(rel) and rel not in gold_surface:
+                _contained_path(workdir, rel, allow_leaf_symlink=True).unlink()
 
 
 def run_tests(

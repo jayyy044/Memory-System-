@@ -1,10 +1,11 @@
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from membench.corpus.extract import BenchTask
-from membench.runner import RunTestsError, _test_passed, run_tests
+from membench.runner import RunTestsError, _reset_test_surface, _test_passed, run_tests
 
 
 # S5: exercises the outcome mapping DIRECTLY, with no docker/pytest run
@@ -196,6 +197,72 @@ def test_hostile_git_config_cannot_execute_on_host(
     finally:
         git_config.write_text(original)
         marker.unlink(missing_ok=True)
+
+
+def test_hostile_gitmodules_cannot_disable_the_delete_pass(
+    sample_task: BenchTask, provisioned_workdir: Path, liquid_repo: Path
+):
+    # S6: the delete pass skipped submodule directories, and learned which
+    # those were by running `git config -f <workspace>/.gitmodules` - an
+    # AGENT-WRITABLE file. Declaring `path = .` made the workspace root
+    # itself a "submodule", so os.walk pruned at the very first directory and
+    # the delete pass visited nothing; a planted root conftest.py then
+    # survived into scoring and forced solved=True. Root cause was a
+    # trust-source split: round 4 moved gold CONTENT to the trusted
+    # reference_repo but left the EXCLUSION LIST coming from the workspace.
+    # Submodule boundaries now come from the gold tree's own gitlink
+    # (type=commit) entries at fix_sha, which also makes `path = .`
+    # impossible to express - a gitlink can never be the tree root.
+    task = _issue_209_task(sample_task)
+    gitmodules = provisioned_workdir / ".gitmodules"
+    conftest = provisioned_workdir / "conftest.py"
+    gitmodules.write_text('[submodule "z"]\n\tpath = .\n\turl = u\n')
+    conftest.write_text(
+        "def pytest_report_teststatus(report, config):\n"
+        "    if report.when == 'call':\n"
+        "        return 'passed', '.', 'PASSED'\n"
+    )
+    try:
+        results = run_tests(provisioned_workdir, task, ["tests/test_issues.py::test_issue_209"], reference_repo=liquid_repo)
+        conftest_survived = conftest.exists()
+    finally:
+        gitmodules.unlink(missing_ok=True)
+        conftest.unlink(missing_ok=True)
+    assert not conftest_survived, "a workspace .gitmodules must not be able to disable the delete pass"
+    assert results["tests/test_issues.py::test_issue_209"] is False
+
+
+def test_symlinked_test_root_cannot_write_outside_workspace(synthetic_repo, tmp_path: Path):
+    # S6: gold restoration did `dest.write_bytes(blob)` after
+    # `dest.parent.mkdir(parents=True, exist_ok=True)`, both of which follow
+    # symlinks. Replacing the gold test root with a symlink pointing out of
+    # the workspace made restoration write gold content THROUGH the link, on
+    # the HOST, as the harness user, outside the container - overwriting (and
+    # for gold's empty tests/__init__.py, truncating to zero) an
+    # attacker-chosen path. The escaping component is the PARENT directory,
+    # not the destination file, so `dest.is_symlink()` alone misses it: every
+    # component under the workspace has to be checked. Fails closed and loud -
+    # a workspace that pulls this is cheating and the run is void.
+    repo, base_sha, fix_sha = synthetic_repo
+    task = BenchTask(
+        task_id="synthetic", repo="local/synthetic", issue_number=0, issue_title="", issue_body="",
+        base_sha=base_sha, fix_sha=fix_sha, changed_files=[],
+    )
+    wd = _synthetic_workdir(repo, base_sha, tmp_path / "ws")
+    # outside the workspace but still inside pytest's tmp_path - a harmless
+    # marker, never a real host path.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "test_good.py"
+    victim.write_text("MARKER - must never be written through a symlink\n")
+
+    shutil.rmtree(wd / "tests")
+    (wd / "tests").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RunTestsError):
+        _reset_test_surface(wd, task, repo)
+    assert victim.read_text() == "MARKER - must never be written through a symlink\n"
+    assert not (outside / "test_broken.py").exists(), "no gold file may be created outside the workspace"
 
 
 def test_modified_test_init_cannot_force_solved(
