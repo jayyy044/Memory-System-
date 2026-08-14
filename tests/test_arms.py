@@ -160,14 +160,43 @@ def test_vault_without_current_md_still_points_at_the_notes(wd: Path, notes: Pat
 
 
 def test_arms_differ_from_each_other(wd: Path, notes: Path, tmp_path: Path):
-    """The one property the experiment cannot survive losing."""
+    """The one property the experiment cannot survive losing.
+
+    Covers the CALIBRATION arms too (OracleArm, PathsOnlyArm): they were built
+    later and left out of this tuple, which is exactly how an arm that quietly
+    degrades into FloorArm gets missed - the test that exists to catch it was
+    not looking at it.
+
+    NullArm is excluded DELIBERATELY and not by omission: it is required to be
+    FloorArm under another name (D76), so it belongs to the opposite assertion,
+    made below and pinned structurally in
+    tests/test_gate.py::test_null_arm_is_structurally_the_floor_arm."""
+    from membench.arms.calibration import NullArm, OracleArm, PathsOnlyArm
+
     (notes / "current.md").write_text("STATE: halfway")
+    task = _task(changed_files=["liquid/builtin/tags/cycle.py"])
+    session_a = Transcript(
+        text="looked at it",
+        # Not task.changed_files: PathsOnlyArm reports what session A TOUCHED
+        # and OracleArm reports the golden answer, so identical inputs here
+        # would make the two arms agree for a reason the benchmark does not have.
+        tool_calls=[ToolCall(name="Read", file_path="liquid/loaders/base.py")],
+    )
+    arms = (
+        FloorArm(), GrepArm(), CeilingArm(), VaultArm(),
+        OracleArm(), PathsOnlyArm(session_a, task.task_id),
+    )
     seen = {}
-    for arm in (FloorArm(), GrepArm(), CeilingArm(), VaultArm()):
+    for arm in arms:
         w = tmp_path / f"ws-{arm.name}"
         w.mkdir()
-        seen[arm.name] = (arm.install(_task(), w, notes), sorted(p.name for p in w.rglob("*")))
-    assert len(set(map(str, seen.values()))) == 4, seen
+        seen[arm.name] = (arm.install(task, w, notes), sorted(p.name for p in w.rglob("*")))
+    assert len(set(map(str, seen.values()))) == len(arms), seen
+    # The one arm that MUST match another, asserted rather than assumed.
+    null_w = tmp_path / "ws-null"
+    null_w.mkdir()
+    assert (NullArm().install(task, null_w, notes), sorted(p.name for p in null_w.rglob("*"))) \
+        == seen["floor"]
 
 
 @pytest.mark.parametrize("arm", [GrepArm(), VaultArm()], ids=lambda a: a.name)

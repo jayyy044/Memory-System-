@@ -22,6 +22,7 @@ into a gate check must move this to a `git apply` from outside the workspace (or
 a plain-filesystem write of gold blobs) before doing so.
 """
 
+import math
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -236,4 +237,240 @@ def check_determinism(task: BenchTask, n: int = 5, *, reference_repo: Path) -> G
         "determinism", True,
         f"golden_patch and broken_baseline each agreed across all {n} repeats "
         f"(golden: {golden[0].detail}; baseline: {baseline[0].detail})",
+    )
+
+
+# --- calibration checks ------------------------------------------------------
+# Named for what they check, not for a plan check-number (D78): the plan's
+# numbering collides with itself across tasks 8, 9 and 12.
+#
+# D74 (CORRECTED) - the input is per-arm, per-TASK-ID outcomes:
+# `dict[str, dict[str, bool]]`, arm name -> task id -> `CorrectnessScore.solved`.
+# Task 9's `run_benchmark` return type is this shape's contract.
+#
+# Two things get thrown away by the shapes this replaces, and each one produced
+# a green result off data that could not support it:
+#   - a pre-reduced float per arm (the plan's shape) hides the SAMPLE SIZE, and
+#     a solve-rate difference is only interpretable against the sampling error
+#     it could have come from;
+#   - a bare `list[bool]` per arm (this module's first shape) hides TASK
+#     IDENTITY. Null-vs-floor is defined as the same condition run twice, so
+#     comparing it across two different task sets measures which tasks were
+#     sampled, not the harness. Measured on the list shape:
+#     `{"null": [True]*3, "floor": [True]*6 + [False]*6}` returned passed=True.
+
+# CALIBRATION KNOB (D75), same status as MIN_SESSION_A_TOOL_CALLS
+# (membench/session_a.py:64): a policy choice about false alarms, not a derived
+# truth. Null and floor are the SAME condition run twice and agent runs are
+# nondeterministic, so their solve rates differ by sampling noise; the plan's
+# fixed tol=0.001 is far below that noise and would report a broken benchmark
+# on every real run. 2.0 standard errors is ~95% two-sided, i.e. roughly a 1-in-22
+# chance this gate cries wolf on a benchmark that is fine. Lower it to catch
+# smaller real differences and accept more false reds; raise it and the check
+# goes vacuous sooner (see _MAX_RATE_DIFF below).
+SIGMA = 2.0
+
+# A solve rate is in [0, 1], so no observed difference can ever exceed this. It
+# is the yardstick the vacuity guard measures the tolerance against.
+_MAX_RATE_DIFF = 1.0
+
+# The oracle check's floor. A POLICY KNOB, unlike the null check's n=3, which is
+# derived: there, n<=2 makes the tolerance meet _MAX_RATE_DIFF so the check
+# provably cannot go red, and 3 is simply the first n where it can. Nothing
+# equivalent forces 3 here - check_oracle_high can go red at n=1. It is set to 3
+# because a green certifies the WHOLE corpus as agent-solvable and one task is
+# not a corpus. 5 or 10 would be equally defensible; tune it against a real
+# corpus run rather than treating this number as derived.
+_MIN_ORACLE_TASKS = 3
+
+
+def _outcomes(results: dict[str, dict[str, bool]], arm: str, check: str) -> dict[str, bool]:
+    """The per-task-id outcomes for one arm, or `GateError`.
+
+    NEVER a default. The plan's version used `.get(arm, 0.0)` on both arms,
+    which made `check_null_equals_floor({})` - no runs at all - return
+    `passed=True`: an empty experiment certifying itself. Verified against the
+    plan's own code before this was written. An absent or empty arm is an
+    orchestration bug and gets the D60 treatment (raise), not a verdict.
+    """
+    if arm not in results:
+        raise GateError(
+            f"{check}: no results for arm {arm!r} (got {sorted(results)}). This check compares "
+            f"arms; with one missing there is nothing to compare and a 'pass' would mean the "
+            f"benchmark never ran. Orchestration bug, not a gate verdict."
+        )
+    got = results[arm]
+    if not isinstance(got, dict) or not all(
+        isinstance(k, str) and isinstance(v, bool) for k, v in got.items()
+    ):
+        raise GateError(
+            f"{check}: arm {arm!r} must be a dict[str, bool] mapping TASK ID to "
+            f"CorrectnessScore.solved, one entry per task - got {type(got).__name__} {got!r}. "
+            f"A pre-reduced float hides the sample size and a bare list[bool] hides task "
+            f"identity; both calibration checks need each (D74 as corrected)."
+        )
+    if not got:
+        raise GateError(
+            f"{check}: arm {arm!r} has an empty result list - zero tasks were scored. A pass "
+            f"here would certify an experiment that never ran."
+        )
+    return got
+
+
+def _pooled_se(s1: int, n1: int, s2: int, n2: int) -> float:
+    """Standard error of the difference of two proportions, pooled under the
+    null hypothesis that both arms have the same true solve rate - which for
+    null-vs-floor is not a hypothesis but the design."""
+    p = (s1 + s2) / (n1 + n2)
+    return math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
+
+
+def check_null_equals_floor(results: dict[str, dict[str, bool]]) -> GateResult:
+    """The null arm and the floor arm are the same condition (see NullArm), so
+    a difference between them is the harness's own run-to-run variance. If it
+    exceeds sampling noise the benchmark is not reproducible and no arm
+    comparison drawn from it means anything.
+
+    The comparison is against `SIGMA` pooled standard errors, not a fixed
+    tolerance (D75). READ THE POWER, NOT JUST THE VERDICT: a small sample cannot
+    detect a small difference, so a pass at n=3 means very little - at n=3 per
+    arm the smallest detectable difference is ~0.82, i.e. this check will only
+    ever catch a near-total divergence. The detail line states that number for
+    the sample actually supplied; an honest wide interval beats a precise wrong
+    one.
+
+    THIS CHECK CANNOT DETECT A DEAD BENCHMARK, AND MUST NOT BE READ ALONE.
+    It measures reproducibility only. The all-same guard below raises at pooled
+    rate exactly 0 or 1, but that closes one point of a continuum, not the
+    continuum: measured at n=100 with floor solving 0, k=1 gives passed=True
+    (diff=0.010, tolerance=0.020). A corpus solving one task in two hundred runs
+    is genuinely reproducible, and this check is right to say so - detecting
+    that nothing is solvable is `check_oracle_high`'s job. A green here is
+    therefore only meaningful alongside a green oracle check; a caller that runs
+    this one on its own can report a healthy benchmark that solves nothing.
+
+    Both arms must cover EXACTLY the same task ids, and that is checked, not
+    assumed: the two arms are the same condition run twice, so a difference
+    computed across two different task sets measures which tasks were sampled
+    rather than the harness's variance. It raises, because disjoint task sets
+    are an orchestration bug and not an experimental outcome.
+
+    Below that it stops being weak and becomes vacuous - at n<=2 per arm even
+    total disagreement (one arm solves everything, the other nothing) sits
+    inside SIGMA standard errors, so the check cannot go red at all. That raises
+    rather than returning the green it structurally must return. `n<=2 per arm`
+    is exact only because the task-set requirement above forces n1 == n2; for
+    unequal arms the vacuous pairs are exactly {(1,1), (1,2), (1,3), (2,1),
+    (2,2), (3,1)} - so n1=1 against n2=4 would NOT raise. Brute-forced over all
+    (n1, n2) in [1,40]^2, not assumed, but unreachable here by construction.
+
+    A third vacuity, and the worst of the three: if every outcome in both arms
+    is identical - nothing solved anywhere, or everything solved - the pooled
+    rate is 0 or 1, so the pooled SE is 0, the tolerance is 0, and diff=0 <= 0
+    passes. A benchmark in which the agent never solves anything would report
+    itself REPRODUCIBLE. Also raises; see the guard below.
+    """
+    null = _outcomes(results, "null", "check_null_equals_floor")
+    floor = _outcomes(results, "floor", "check_null_equals_floor")
+    if null.keys() != floor.keys():
+        raise GateError(
+            f"check_null_equals_floor: the two arms did not run the same tasks - "
+            f"only in null: {sorted(null.keys() - floor.keys())}, "
+            f"only in floor: {sorted(floor.keys() - null.keys())}. Null and floor are the SAME "
+            f"condition run twice, so across different task sets the difference measures which "
+            f"tasks were sampled, not the harness. Orchestration bug, not a gate verdict."
+        )
+    n1 = n2 = len(null)
+    # Worst case = total disagreement: max possible diff (1.0), and the pooled
+    # rate it implies. If even that passes, no result can fail this check.
+    if SIGMA * _pooled_se(n1, n1, 0, n2) >= _MAX_RATE_DIFF:
+        raise GateError(
+            f"check_null_equals_floor: sample too small to mean anything - null n={n1}, "
+            f"floor n={n2}. At this size even total disagreement (one arm solves every task, "
+            f"the other none) is within {SIGMA} standard errors, so the check cannot fail and a "
+            f"pass would certify nothing. Raise repeats or the task count; do not read this as "
+            f"a green gate."
+        )
+    s1, s2 = sum(null.values()), sum(floor.values())
+    if s1 + s2 in (0, n1 + n2):
+        # Pooled rate 0 or 1 => pooled SE 0 => tolerance 0, and both arms are
+        # necessarily identical, so this ALWAYS returned passed=True on data
+        # carrying no information. Same class as the guard above (the check
+        # cannot go red), so the same treatment - and the all-False case is the
+        # one that matters: a dead benchmark must never read as reproducible.
+        why = (
+            "every task was solved by both arms: the corpus is too easy to measure memory with"
+            if s1 else
+            "NOTHING was solved by either arm: the harness or the corpus is broken, and this "
+            "check would otherwise certify a dead benchmark as reproducible"
+        )
+        raise GateError(
+            f"check_null_equals_floor: degenerate sample - {why} (null {s1}/{n1}, floor "
+            f"{s2}/{n2}). The pooled rate is {'1' if s1 else '0'}, so the pooled standard error "
+            f"is 0, the tolerance is 0, and the two rates carry no information: this check "
+            f"cannot fail here and a pass means nothing. Do NOT read it as reproducibility "
+            f"confirmed."
+        )
+    diff = abs(s1 / n1 - s2 / n2)
+    tol = SIGMA * _pooled_se(s1, n1, s2, n2)
+    return GateResult(
+        "null_equals_floor", diff <= tol,
+        f"null {s1}/{n1} (n={n1}) vs floor {s2}/{n2} (n={n2}): diff={diff:.3f}, "
+        f"tolerance={tol:.3f} (SIGMA={SIGMA} pooled standard errors). A difference below "
+        f"{tol:.3f} is undetectable at this sample size, so a pass is weak evidence.",
+    )
+
+
+def check_oracle_high(results: dict[str, dict[str, bool]], threshold: float = 0.8) -> GateResult:
+    """The oracle arm is handed the golden answer's file list, so if it does not
+    score high the task is not solvable by this agent at all and every other
+    arm's number is measuring the model's ceiling rather than memory.
+
+    Point estimate against `threshold`, with the sample size in the detail: the
+    estimate is coarse at small n and stays honest by saying so rather than by
+    widening. At n=3 the only rates available are 0, 0.33, 0.67 and 1.0, so the
+    default threshold demands a perfect 3/3 - and 3/3 is still consistent with a
+    true rate as low as ~0.37 (95% one-sided). The failure direction is the safe
+    one: small samples make this check strict, not lenient.
+
+    Strict is not the same as meaningful, though, which is why n is floored at
+    `_MIN_ORACLE_TASKS`: a green here certifies that the whole corpus is
+    agent-solvable, and one task is not a corpus. `threshold` is range-checked
+    for the same reason - at threshold <= 0 the comparison is unconditionally
+    true and 0/10 solved would certify the corpus.
+    """
+    if threshold <= 0.0 or threshold > 1.0:
+        # NaN passes through this guard deliberately: every comparison against
+        # NaN is False, so `rate >= threshold` below is False and a nonsense
+        # threshold fails CLOSED. Raising would be safe too; failing closed is
+        # the behaviour that already existed and is worth keeping.
+        raise GateError(
+            f"check_oracle_high: threshold={threshold} is outside (0, 1]. A solve rate is a "
+            f"proportion, so at threshold <= 0 `rate >= threshold` is unconditionally true and "
+            f"an oracle arm that solved NOTHING would certify the corpus as agent-solvable; "
+            f"above 1 it can never pass. Caller bug, not a gate verdict."
+        )
+    oracle = _outcomes(results, "oracle", "check_oracle_high")
+    n = len(oracle)
+    solved = sum(oracle.values())
+    rate = solved / n
+    if n < _MIN_ORACLE_TASKS and rate >= threshold:
+        # One-sided on purpose. The danger at small n is a GREEN read off too
+        # little evidence - a pass here says every other arm's number measures
+        # memory rather than the model's ceiling, and one task cannot support
+        # that. A RED at small n is not the same thing: the oracle arm is handed
+        # the answer, so failing to solve 1/1 or 0/2 is a real, informative
+        # result and raising over it would swallow a finding. An earlier version
+        # of this guard raised on both, which turned an accurate `passed=False`
+        # into an exception.
+        raise GateError(
+            f"check_oracle_high: sample too small to certify a corpus - n={n}, minimum "
+            f"{_MIN_ORACLE_TASKS}, and this input WOULD have passed ({solved}/{n} >= "
+            f"{threshold}). At n<=2 the only rates that exist are 0, 0.5 and 1, so a single "
+            f"task flipping moves the estimate by half the scale. Corpus/orchestration bug, "
+            f"not a gate verdict. A FAILING oracle at this n is reported normally."
+        )
+    return GateResult(
+        "oracle_high", rate >= threshold,
+        f"oracle solved {solved}/{n} (n={n}) = {rate:.3f}, threshold {threshold}",
     )
