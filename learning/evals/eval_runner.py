@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))   # learning/
 sys.path.insert(0, str(Path(__file__).parent))          # evals/
 
 from agent import modelTurns, SYSTEM
-from tool import bash
+from tool import bash, read_file
 from cases import ALL_CASES
 
 
@@ -17,14 +17,14 @@ async def run_case(case) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as d:
         case["setup"](d)
 
-        dispatch = {"bash": partial(bash, cwd=d)}
+        dispatch = {"bash": partial(bash, cwd=d), "read_file": partial(read_file, cwd=d)}
         history = [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": case["prompt"]},
         ]
 
         try:
-            out = await modelTurns(history, dispatch=dispatch)
+            out = await modelTurns(history, dispatch=dispatch, max_hops=case.get("max_hops", 5))
         except Exception:
             return False, traceback.format_exc(limit=1).strip()
 

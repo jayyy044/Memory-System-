@@ -1,28 +1,29 @@
 from pathlib import Path
 
-SECRET = "alpine-quartz"
+SECRET = "hamburgers are so tasty"
 
 
 def setup(d):
     lines = [f"line {i:04d}: {'x' * 60}" for i in range(600)]
-    lines[300] = f"line 0300: SECRET={SECRET}"
+    lines[449] = f"line 0450: SECRET={SECRET}"
     (Path(d) / "data.txt").write_text("\n".join(lines) + "\n")
 
 
 def check(d, out, history):
     answered = SECRET in out
-    truncated = any(
-        m.get("role") == "tool" and "chars omitted" in (m.get("content") or "")
+    used_read_file = any(
+        c["function"]["name"] == "read_file"
         for m in history
+        for c in (m.get("tool_calls") or [])
     )
-    return answered and truncated
+    return answered and used_read_file
 
 
 CASES = [
     {
-        "name": "truncated_output_recovery",
+        "name": "read_specific_line",
         "setup": setup,
-        "prompt": "read data.txt and tell me what the SECRET value is",
+        "prompt": "what is on line 450 of data.txt?",
         "check": check,
     },
 ]

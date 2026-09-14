@@ -2,11 +2,11 @@ import asyncio
 import os
 import requests
 from dotenv import load_dotenv
-from tool import bash_tool, bash
+from tool import bash_tool, bash, read_file, read_file_tool
 import json
 
-TOOLS = [bash_tool]
-DISPATCH = {"bash": bash}
+TOOLS = [bash_tool, read_file_tool]
+DISPATCH = {"bash": bash, "read_file" : read_file}
 
 load_dotenv()
 
@@ -77,7 +77,11 @@ def toolRun(calls, history, hops_left, dispatch):
         history.append({
             "role": "tool",
             "tool_call_id": call["id"],
-            "content": f"{result}\n\n[{hops_left} tool iterations left this turn]",
+            "content": f"{result}\n\n" + (
+                "[tool budget exhausted — answer now with what you have so far]"
+                if hops_left == 0 else
+                f"[{hops_left} tool iterations left this turn]"
+            ),
         })
 
 
@@ -93,23 +97,29 @@ async def modelTurns(history: list[dict], dispatch: dict, max_hops: int = 5) -> 
 
         toolRun(calls, history, hops_left=max_hops - i - 1, dispatch=dispatch)
 
-        last = (i == max_hops - 1)
-        reply = await modelRequest(history, tools=None if last else TOOLS)
+        reply = await modelRequest(history, tools=TOOLS)
         msg = reply["choices"][0]["message"]
         history.append(cleanMsg(msg))
 
-    return msg["content"]
+    # budget spent; model may still ask for tools. Refuse to run them, ask once
+    # more for text. Tools stay in the request so the API never rejects a call.
+    if msg.get("tool_calls"):
+        for call in msg["tool_calls"]:
+            history.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": "[tool budget exhausted — answer now with what you have so far]",
+            })
+        reply = await modelRequest(history, tools=TOOLS)
+        msg = reply["choices"][0]["message"]
+        history.append(cleanMsg(msg))
+
+    return msg["content"] or "[no answer: tool budget exhausted]"
 
 SYSTEM = (
     "You are a coding agent working inside a git repository. Your job is to "
     "complete the user's task, not to explore the repository.\n\n"
     "Rules:\n"
-    "- If the task names a command or a file, run or read it directly. Do not "
-    "list directories first.\n"
-    "- Use the fewest tool calls that get the task done. Every call costs.\n"
-    "- Never re-run a command whose output is already in this conversation.\n"
-    "- When done, report the result in two or three lines: what you ran, the "
-    "exit code, and the answer. No preamble.\n"
     "- If the task is genuinely ambiguous, ask one short question. Otherwise act."
 )
 
