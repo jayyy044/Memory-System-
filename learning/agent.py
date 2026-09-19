@@ -88,10 +88,32 @@ def toolRun(calls, history, hops_left, dispatch):
         })
 
 
-async def modelTurns(history: list[dict], dispatch: dict, max_hops: int = 5) -> str:
-    reply = await modelRequest(history, tools=TOOLS)
+async def askModel(history: list[dict]) -> dict:
+    """One model request, appended to history. If the provider rejects the
+    model's own tool call (made-up tool name, bad JSON), tell the model what was
+    wrong and ask once more instead of dying — the model never saw its mistake."""
+    try:
+        reply = await modelRequest(history, tools=TOOLS)
+    except requests.HTTPError as e:
+        err = {}
+        try:
+            err = e.response.json().get("error", {})
+        except Exception:
+            pass
+        if err.get("code") != "tool_use_failed":
+            raise
+        names = ", ".join(t["function"]["name"] for t in TOOLS)
+        history.append({"role": "user", "content":
+            f"[harness] Your last tool call was rejected: {err.get('message')}. "
+            f"Available tools: {names}. For grep, sed, find and similar, use bash."})
+        reply = await modelRequest(history, tools=TOOLS)
     msg = reply["choices"][0]["message"]
     history.append(cleanMsg(msg))
+    return msg
+
+
+async def modelTurns(history: list[dict], dispatch: dict, max_hops: int = 5) -> str:
+    msg = await askModel(history)
 
     for i in range(max_hops):
         calls = msg.get("tool_calls")
@@ -100,9 +122,7 @@ async def modelTurns(history: list[dict], dispatch: dict, max_hops: int = 5) -> 
 
         toolRun(calls, history, hops_left=max_hops - i - 1, dispatch=dispatch)
 
-        reply = await modelRequest(history, tools=TOOLS)
-        msg = reply["choices"][0]["message"]
-        history.append(cleanMsg(msg))
+        msg = await askModel(history)
 
     # budget spent; model may still ask for tools. Refuse to run them, ask once
     # more for text. Tools stay in the request so the API never rejects a call.
@@ -113,9 +133,7 @@ async def modelTurns(history: list[dict], dispatch: dict, max_hops: int = 5) -> 
                 "tool_call_id": call["id"],
                 "content": "[tool budget exhausted — answer now with what you have so far]",
             })
-        reply = await modelRequest(history, tools=TOOLS)
-        msg = reply["choices"][0]["message"]
-        history.append(cleanMsg(msg))
+        msg = await askModel(history)
 
     return msg["content"] or "[no answer: tool budget exhausted]"
 

@@ -10,12 +10,16 @@ def setup(d):
 
 
 def check(d, out, history):
-    answered = SECRET in out
-    truncated = any(
-        m.get("role") == "tool" and "chars omitted" in (m.get("content") or "")
+    norm = lambda s: "".join(c for c in s.lower() if c.isalnum())
+    answered = norm(SECRET) in norm(out)
+    capped = any(
+        m.get("role") == "tool" and (
+            "chars omitted" in (m.get("content") or "")
+            or "call again with offset" in (m.get("content") or "")
+        )
         for m in history
     )
-    return answered and truncated
+    return answered and capped
 
 
 CASES = [

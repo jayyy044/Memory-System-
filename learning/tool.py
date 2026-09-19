@@ -108,6 +108,14 @@ def read_file(path: str, offset: int = 1, limit: int = 200, cwd: str | None = No
         return f"error: offset {offset} is past end of file ({total} lines)"
 
     window = lines[offset - 1: offset - 1 + limit]
+    # cap total chars too: 200 lines x 400 chars is 80k, bash is capped at 2k
+    CHARS = 2000
+    used = 0
+    for i, ln in enumerate(window):
+        used += len(ln[:400]) + 8          # 8 for the number gutter
+        if used > CHARS:
+            window = window[:max(1, i)]
+            break
     body = "\n".join(f"{offset + i:6d}  {ln[:400]}" for i, ln in enumerate(window))
 
     end = offset + len(window) - 1

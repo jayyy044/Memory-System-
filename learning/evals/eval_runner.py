@@ -18,10 +18,8 @@ async def run_case(case) -> tuple[bool, str]:
         case["setup"](d)
 
         dispatch = {"bash": partial(bash, cwd=d), "read_file": partial(read_file, cwd=d)}
-        history = [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": case["prompt"]},
-        ]
+        history = case["history"](d) if "history" in case else [{"role": "system", "content": SYSTEM}]
+        history.append({"role": "user", "content": case["prompt"]})
 
         try:
             out = await modelTurns(history, dispatch=dispatch, max_hops=case.get("max_hops", 5))
