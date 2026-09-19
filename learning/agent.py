@@ -3,7 +3,9 @@ import os
 import requests
 from dotenv import load_dotenv
 from tool import bash_tool, bash, read_file, read_file_tool
-import json
+import json , uuid
+from pathlib import Path
+from transcripts import Transcript
 
 TOOLS = [bash_tool, read_file_tool]
 DISPATCH = {"bash": bash, "read_file" : read_file}
@@ -125,7 +127,14 @@ SYSTEM = (
 
 
 async def main():
-    history = [{"role": "system", "content": SYSTEM}]
+    SESSIONS = Path(__file__).parent / "sessions"
+    SESSIONS.mkdir(parents=True, exist_ok=True)
+
+    session_id = uuid.uuid4()
+
+    history = Transcript(SESSIONS / f"{session_id}.jsonl")
+    history.append({"role": "system", "content": SYSTEM})
+
 
     while True:
         try:
@@ -133,16 +142,18 @@ async def main():
         except EOFError:
             break
         if line.strip().lower() in ("quit", "exit"):
+            print(f"resume this session by python3 agent.py --resume {session_id}")
             break
 
         mark = len(history)
         history.append({"role": "user", "content": line})
         try:
-            reply = await modelTurns(history, dispatch=DISPATCH)        
+            reply = await modelTurns(history, dispatch=DISPATCH)
         except requests.HTTPError as e:
             print(f"\n[groq error: {e}]")
             del history[mark:]
             continue
+
 
         print(reply)
 
