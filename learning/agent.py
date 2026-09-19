@@ -6,6 +6,7 @@ from tool import bash_tool, bash, read_file, read_file_tool
 import json , uuid
 from pathlib import Path
 from transcripts import Transcript
+import sys
 
 TOOLS = [bash_tool, read_file_tool]
 DISPATCH = {"bash": bash, "read_file" : read_file}
@@ -130,10 +131,27 @@ async def main():
     SESSIONS = Path(__file__).parent / "sessions"
     SESSIONS.mkdir(parents=True, exist_ok=True)
 
-    session_id = uuid.uuid4()
+    resume_id = None
+    if "--resume" in sys.argv:
+        i = sys.argv.index("--resume")
+        if i + 1 < len(sys.argv):
+            resume_id = sys.argv[i + 1]
+        else:
+            sys.exit("--resume needs a session id")
 
-    history = Transcript(SESSIONS / f"{session_id}.jsonl")
-    history.append({"role": "system", "content": SYSTEM})
+    if resume_id:
+        path = SESSIONS / f"{resume_id}.jsonl"
+        if not path.exists():
+            sys.exit(f"no such session: {resume_id}")
+        session_id = resume_id
+        history = Transcript(path)
+        history.load()
+        print(f"[resumed {session_id}, {len(history)} messages]")
+    else:
+        session_id = uuid.uuid4()
+        history = Transcript(SESSIONS / f"{session_id}.jsonl")
+        history.append({"role": "system", "content": SYSTEM})
+        print(f"[session {session_id}]")
 
 
     while True:

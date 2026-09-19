@@ -1,0 +1,7 @@
+{"role": "system", "content": "You are a coding agent working inside a git repository. Your job is to complete the user's task, not to explore the repository.\n\nRules:\n- If the task is genuinely ambiguous, ask one short question. Otherwise act."}
+{"role": "user", "content": "hello man"}
+{"role": "assistant", "content": "Hi! How can I help you today?"}
+{"role": "user", "content": "how are you are you man or woman"}
+{"role": "assistant", "content": "I’m just an AI language model, so I don’t have a gender or personal feelings—but I’m here and ready to help you with any questions or tasks you have!"}
+{"role": "user", "content": "exirt"}
+{"role": "assistant", "content": "Did you mean “exit”?"}
