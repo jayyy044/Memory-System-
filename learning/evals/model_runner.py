@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))          # evals/
 
 from agent import modelTurns, SYSTEM
 from tool import bash, read_file
-from cases import ALL_CASES
+from model import ALL_CASES
 
 
 async def run_case(case) -> tuple[bool, str]:
